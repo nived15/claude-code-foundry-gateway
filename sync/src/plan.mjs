@@ -9,7 +9,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { toEntitlement } from '../../resolver/src/entitlement.mjs';
+import { toEntitlement, CATALOG_TIER, catalogRecordProblem } from '../../resolver/src/entitlement.mjs';
 
 export const TIERS_BY_PRECEDENCE = ['premium', 'standard'];
 export const MAX_PROJECTION_AGE_SECONDS = 7200;
@@ -18,6 +18,15 @@ export const STATUS_PARTITION_PREFIX = 'projection-status::';
 export const STATUS_TTL_SECONDS = 604800;
 export const APPLY_LOCK_RECORD_TYPE = 'projection-apply-lock';
 export const APPLY_LOCK_ID = 'projection-apply-lock';
+export const ACCESS_CATALOG_TYPE = 'access-catalog';
+export const ACCESS_CATALOG_PREFIX = 'access-catalog::';
+export const MULTIPLE_GROUP_RULES = ['highest-monthly', 'deny'];
+export const CATALOG_FIELDS = ['profile', 'models', 'tokensPerMonth', 'tokensPerDay'];
+
+/** The catalog document's id and partition key: not a GUID, so no resolver point read can reach it. */
+export function accessCatalogId(tenantId) {
+  return `${ACCESS_CATALOG_PREFIX}${tenantId}`;
+}
 
 export function createReconciliation({ verifiedAt, now = new Date(), maxAgeSeconds = MAX_PROJECTION_AGE_SECONDS } = {}) {
   const start = new Date(verifiedAt).getTime();
@@ -65,6 +74,88 @@ export function mergeMembership({ tiers = {}, businessUnits = [] } = {}) {
 }
 
 /**
+ * Why an access catalog document cannot be applied, as a list; empty when it can. The same rules as
+ * ClaudeAccessCatalog.ps1, which produced it, checked again where it is used.
+ */
+export function validateAccessCatalog(doc, { tenantId } = {}) {
+  const problems = [];
+  if (!doc || typeof doc !== 'object') return ['access catalog is not an object'];
+  if (doc.type !== ACCESS_CATALOG_TYPE) problems.push(`type is not '${ACCESS_CATALOG_TYPE}'`);
+  if (!GUID.test(doc.tenantId ?? '')) problems.push('tenantId is not a guid');
+  else if (tenantId && doc.tenantId.toLowerCase() !== tenantId.toLowerCase()) problems.push(`access catalog is for tenant ${doc.tenantId}, not ${tenantId}`);
+  if (doc.id !== accessCatalogId(doc.tenantId) || doc.oid !== doc.id) problems.push('id and oid must both be access-catalog::<tenantId>');
+  if (!MULTIPLE_GROUP_RULES.includes(doc.multipleGroupRule)) problems.push(`multipleGroupRule must be one of ${MULTIPLE_GROUP_RULES.join(', ')}`);
+  const profiles = new Set();
+  for (const p of Array.isArray(doc.profiles) ? doc.profiles : []) {
+    const problem = catalogRecordProblem({ profile: p?.id, models: p?.models, tokensPerMonth: p?.tokensPerMonth, tokensPerDay: p?.tokensPerDay });
+    if (problem) problems.push(`profile '${p?.id}': ${problem.replace('catalog record ', '')}`);
+    else if (profiles.has(p.id)) problems.push(`profile '${p.id}' appears twice`);
+    else profiles.add(p.id);
+  }
+  if (!Array.isArray(doc.profiles) || !doc.profiles.length) problems.push('profiles is empty');
+  const groups = new Set();
+  const rows = new Set();
+  for (const g of Array.isArray(doc.groups) ? doc.groups : []) {
+    if (!GUID.test(g?.objectId ?? '')) { problems.push(`group objectId '${g?.objectId}' is not a guid`); continue; }
+    const key = g.objectId.toLowerCase();
+    if (groups.has(key)) problems.push(`group ${g.objectId} appears twice`);
+    groups.add(key);
+    if (!Number.isSafeInteger(g.row) || g.row < 1) problems.push(`group ${g.objectId} has no valid row`);
+    else if (rows.has(g.row)) problems.push(`row ${g.row} appears twice`);
+    else rows.add(g.row);
+    if (!profiles.has(g.profile)) problems.push(`group ${g.objectId} names profile '${g.profile}', which the catalog does not define`);
+  }
+  if (!Array.isArray(doc.groups) || !doc.groups.length) problems.push('groups is empty');
+  return problems;
+}
+
+/**
+ * One record per identity from the catalog's groups. A person in several groups gets the profile with the
+ * larger monthly allowance, the lower row breaking a tie, unless the catalog's rule is deny, when they get
+ * none. The rule is Resolve-ClaudeAccessAssignment's in ClaudeAccessCatalog.ps1.
+ *
+ *   membersByGroup  { groupObjectId: [{ oid, name }] } or a Map of the same
+ */
+export function resolveCatalogRecords(doc, membersByGroup) {
+  const lookup = (id) => {
+    const get = (key) => (membersByGroup instanceof Map ? membersByGroup.get(key) : membersByGroup?.[key]);
+    return get(id) ?? get(id.toLowerCase()) ?? [];
+  };
+  const profiles = new Map(doc.profiles.map((p) => [p.id, p]));
+  const byOid = new Map();
+  for (const g of [...doc.groups].sort((a, b) => a.row - b.row)) {
+    for (const m of lookup(g.objectId)) {
+      if (!GUID.test(m?.oid ?? '')) continue;
+      const oid = m.oid.toLowerCase();
+      if (!byOid.has(oid)) byOid.set(oid, { name: m.name ?? '', groups: [] });
+      const entry = byOid.get(oid);
+      if (!entry.groups.includes(g)) entry.groups.push(g);
+    }
+  }
+  const records = [];
+  const conflicts = [];
+  const denied = [];
+  for (const [oid, { name, groups }] of byOid) {
+    if (groups.length > 1) conflicts.push({ oid, rows: groups.map((g) => g.row) });
+    if (groups.length > 1 && doc.multipleGroupRule === 'deny') { denied.push(oid); continue; }
+    const chosen = groups.reduce((best, g) => {
+      const a = profiles.get(best.profile).tokensPerMonth;
+      const b = profiles.get(g.profile).tokensPerMonth;
+      return b > a || (b === a && g.row < best.row) ? g : best;
+    });
+    const p = profiles.get(chosen.profile);
+    records.push({ oid, name, tier: CATALOG_TIER, businessUnit: '', profile: p.id, models: p.models, tokensPerMonth: p.tokensPerMonth, tokensPerDay: p.tokensPerDay });
+  }
+  return { records, conflicts, denied };
+}
+
+function sameEntitlement(current, wanted) {
+  if (current.tier !== wanted.tier || (current.businessUnit ?? '') !== (wanted.businessUnit ?? '')) return false;
+  if (wanted.tier !== CATALOG_TIER) return true;
+  return CATALOG_FIELDS.every((field) => current[field] === wanted[field]);
+}
+
+/**
  * Decide what to write and what to remove.
  *
  *   resolved  records from mergeMembership, or from a snapshot
@@ -88,7 +179,7 @@ export function planChanges(resolved, existing, { allowEmpty = false, keepOrphan
   for (const r of resolved) {
     wanted.add(r.oid);
     const cur = existing.get(r.oid);
-    if (cur && cur.tier === r.tier && (cur.businessUnit ?? '') === (r.businessUnit ?? '')) {
+    if (cur && sameEntitlement(cur, r)) {
       if (Object.hasOwn(cur, 'expiresAt')) {
         toWrite.push(r);
         continue;
@@ -135,6 +226,7 @@ export function toDocument(r, { tenantId, mappingVersion, reconciliation }) {
     effectiveFrom: null,
     reconciliationGeneration: reconciliation?.reconciliationGeneration,
     lastVerifiedAt: reconciliation?.lastVerifiedAt,
+    ...(r.tier === CATALOG_TIER ? Object.fromEntries(CATALOG_FIELDS.map((field) => [field, r[field]])) : {}),
   };
 }
 
@@ -156,7 +248,8 @@ export function isStatusRecord(doc) {
 }
 
 export function isControlRecord(doc) {
-  return Boolean(doc) && (isStatusRecord(doc) || doc.type === APPLY_LOCK_RECORD_TYPE);
+  return Boolean(doc) && (isStatusRecord(doc) || doc.type === APPLY_LOCK_RECORD_TYPE || doc.type === ACCESS_CATALOG_TYPE ||
+    (typeof doc.id === 'string' && doc.id.startsWith(ACCESS_CATALOG_PREFIX)));
 }
 
 export function toStatusDocument({
@@ -305,12 +398,12 @@ export function compareWithSnapshot(snapshot, records, { tenantId, now = new Dat
   const problems = validateSnapshot(snapshot, { tenantId, now });
   if (snapshot?.scope && snapshot.scope !== 'full') problems.push("--compare-snapshot expects a full snapshot");
   if (problems.length) return { refused: true, problems };
-  const expected = new Map((snapshot.records ?? []).map((r) => [r.oid, { tier: r.tier, businessUnit: r.businessUnit ?? '' }]));
+  const expected = new Map((snapshot.records ?? []).map((r) => [r.oid, { tier: r.tier, businessUnit: r.businessUnit ?? '', profile: r.profile ?? '' }]));
   const live = new Map();
   for (const r of records ?? []) {
     if (isControlRecord(r)) continue;
     if (!toEntitlement(r, { tenantId, now }).ok) continue;
-    live.set(r.oid ?? r.id, { tier: r.tier, businessUnit: r.businessUnit ?? '' });
+    live.set(r.oid ?? r.id, { tier: r.tier, businessUnit: r.businessUnit ?? '', profile: r.profile ?? '' });
   }
   const all = new Set([...expected.keys(), ...live.keys()]);
   const differences = [];
@@ -319,7 +412,9 @@ export function compareWithSnapshot(snapshot, records, { tenantId, now = new Dat
     const got = live.get(oid);
     if (!want && got) differences.push({ oid, kind: 'would-delete-record', snapshot: 'absent', projection: got.tier });
     else if (want && !got) differences.push({ oid, kind: 'missing-record', snapshot: want.tier, projection: 'absent' });
-    else if (want.tier !== got.tier) differences.push({ oid, kind: 'tier-drift', snapshot: want.tier, projection: got.tier });
+    else if (want.tier !== got.tier || want.profile !== got.profile) {
+      differences.push({ oid, kind: 'tier-drift', snapshot: want.profile || want.tier, projection: got.profile || got.tier });
+    }
     else if ((want.businessUnit ?? '') !== (got.businessUnit ?? '')) {
       differences.push({ oid, kind: 'unit-drift', snapshot: want.businessUnit || '(unassigned)', projection: got.businessUnit || '(unassigned)' });
     }
@@ -427,7 +522,10 @@ export function validateSnapshot(snap, { tenantId, now = new Date() } = {}) {
   if (!Array.isArray(snap.records)) problems.push('records is not an array');
   for (const r of snap.records ?? []) {
     if (!GUID.test(r.oid ?? '')) { problems.push(`record oid '${r.oid}' is not a guid`); break; }
-    if (!TIERS_BY_PRECEDENCE.includes(r.tier)) { problems.push(`record ${r.oid} names tier '${r.tier}'`); break; }
+    if (r.tier === CATALOG_TIER) {
+      const problem = catalogRecordProblem(r);
+      if (problem) { problems.push(`record ${r.oid}: ${problem}`); break; }
+    } else if (!TIERS_BY_PRECEDENCE.includes(r.tier)) { problems.push(`record ${r.oid} names tier '${r.tier}'`); break; }
   }
   const seen = new Set();
   for (const r of snap.records ?? []) {

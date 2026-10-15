@@ -57,14 +57,15 @@ globalThis.fetch = async (input) => {
   if (url.host !== 'graph.microsoft.com') throw new Error(`fake graph refuses ${url.host}`);
   const members = /^\/v1\.0\/groups\/([^/]+)\/transitiveMembers\/microsoft\.graph\.(user|servicePrincipal)$/.exec(url.pathname);
   if (members) {
-    const [, , cast] = members;
+    const [, groupId, cast] = members;
     if (cast === 'servicePrincipal') return response(200, { value: [] });
     maybeInjectConcurrentStatus();
+    // FAKE_GRAPH_GROUP_USERS answers per group: 'groupId=oid|oid;groupId=oid'. Other groups get FAKE_GRAPH_USERS.
+    const perGroup = Object.fromEntries((process.env.FAKE_GRAPH_GROUP_USERS ?? '').split(';').filter(Boolean)
+      .map((entry) => { const [id, users] = entry.split('='); return [id, users.split('|').filter(Boolean)]; }));
+    const users = perGroup[groupId] ?? (process.env.FAKE_GRAPH_USERS ?? '').split(',').filter(Boolean);
     return response(200, {
-      value: (process.env.FAKE_GRAPH_USERS ?? '')
-        .split(',')
-        .filter(Boolean)
-        .map((id) => ({ id, userPrincipalName: `${id.slice(0, 8)}@example.invalid`, displayName: id })),
+      value: users.map((id) => ({ id, userPrincipalName: `${id.slice(0, 8)}@example.invalid`, displayName: id })),
     });
   }
   if (url.pathname === '/v1.0/groups') {

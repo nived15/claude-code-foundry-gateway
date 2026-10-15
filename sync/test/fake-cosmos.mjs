@@ -21,7 +21,7 @@ class Items {
     if (/\bWHERE\b/i.test(text)) throw new Error(`fake Cosmos: the container indexes only /oid; a WHERE clause scans every record: ${text}`);
     log(`query ${text}${options.partitionKey !== undefined ? ` partition=${options.partitionKey}` : ''}`);
     const docs = Object.values(load().docs);
-    const rows = options.partitionKey !== undefined ? docs.filter((d) => d.oid === options.partitionKey) : docs;
+    const rows = project(text, options.partitionKey !== undefined ? docs.filter((d) => d.oid === options.partitionKey) : docs);
     const pages = paginate(rows);
     let page = 0;
     return {
@@ -146,6 +146,14 @@ export class CosmosClient {
 function withEtag(doc, store) {
   store.etagCounter = (store.etagCounter ?? 0) + 1;
   return { ...doc, _etag: `"${store.etagCounter}"` };
+}
+
+// Like Cosmos, a field list returns those fields only, so a reader that forgets a field sees it missing.
+function project(text, docs) {
+  const list = /^\s*SELECT\s+(.+?)\s+FROM\s+c\b/i.exec(text)?.[1]?.trim();
+  if (!list || list === '*') return docs;
+  const fields = list.split(',').map((f) => f.trim().replace(/^c\./, ''));
+  return docs.map((d) => Object.fromEntries(fields.filter((f) => Object.hasOwn(d, f)).map((f) => [f, d[f]])));
 }
 
 function paginate(rows) {

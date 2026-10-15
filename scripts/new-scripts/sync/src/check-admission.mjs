@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+import { evaluateProjectionAdmission, statusPartitionKey, STATUS_RECORD_TYPE, CATALOG_FIELDS } from './plan.mjs';
+
+const argv = process.argv.slice(2);
+const opt = (name, fallback) => {
+  const i = argv.indexOf(name);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback;
+};
+
+const endpoint = opt('--cosmos', process.env.COSMOS_ENDPOINT);
+const tenantId = (opt('--tenant', process.env.PROJECTION_TENANT_ID) ?? '').toLowerCase();
+const accountResourceId = opt('--account-resource-id', process.env.PROJECTION_ACCOUNT_RESOURCE_ID);
+const databaseName = opt('--database', 'claude');
+const containerName = opt('--container', 'entitlement');
+const maxEvidenceAgeSeconds = Number(opt('--max-evidence-age-seconds', '86400'));
+
+function fail(error, code = 1) {
+  console.log(JSON.stringify({ ok: false, mode: 'switch-evidence', error }));
+  process.exit(code);
+}
+
+if (!endpoint) fail('--cosmos is required');
+if (!tenantId) fail('--tenant is required');
+if (!accountResourceId) fail('--account-resource-id is required');
+if (!isCosmosEndpoint(endpoint)) fail('--cosmos must be an https Cosmos DB endpoint URL');
+if (!isGuid(tenantId)) fail('--tenant must be a guid');
+if (!isCosmosAccountResourceId(accountResourceId)) fail('--account-resource-id must be a Cosmos DB database account resource id');
+if (!Number.isFinite(maxEvidenceAgeSeconds) || maxEvidenceAgeSeconds <= 0) fail('--max-evidence-age-seconds must be positive');
+
+// The Azure SDKs load only after the arguments pass, so a refused call needs no installed dependency.
+const { CosmosClient } = await import('@azure/cosmos');
+const { DefaultAzureCredential } = await import('@azure/identity');
+const credential = new DefaultAzureCredential();
+const container = new CosmosClient({ endpoint, aadCredentials: credential })
+  .database(databaseName)
+  .container(containerName);
+
+// The container indexes only /oid (infra/projection.bicep): no WHERE clause, which would scan every
+// record. Statuses are read from their own partition; typed documents are skipped in the client.
+const statuses = [];
+const it = container.items.query('SELECT * FROM c', { maxItemCount: 1000, partitionKey: statusPartitionKey(tenantId) });
+while (it.hasMoreResults()) {
+  const { resources } = await it.fetchNext();
+  statuses.push(...(resources ?? []).filter((s) => s.type === STATUS_RECORD_TYPE && s.tenantId === tenantId &&
+    s.databaseName === databaseName && s.containerName === containerName));
+}
+
+const entitlementRecords = [];
+const entitlementIterator = container.items.query(`SELECT c.id, c.oid, c.tenantId, c.tier, c.businessUnit, c.mappingVersion, c.effectiveFrom, c.reconciliationGeneration, c.lastVerifiedAt, c.expiresAt, c.type, ${CATALOG_FIELDS.map((f) => `c.${f}`).join(', ')} FROM c`, { maxItemCount: 1000 });
+while (entitlementIterator.hasMoreResults()) {
+  const { resources } = await entitlementIterator.fetchNext();
+  entitlementRecords.push(...(resources ?? []).filter((r) => r.type === undefined));
+}
+
+const result = evaluateProjectionAdmission({
+  statuses,
+  entitlementRecords,
+  expected: { tenantId, accountResourceId, databaseName, containerName },
+  maxEvidenceAgeSeconds,
+});
+console.log(JSON.stringify(result));
+process.exit(result.ok ? 0 : 4);
+
+function isGuid(value) {
+  return typeof value === 'string' &&
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
+}
+
+function isCosmosEndpoint(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && /\.documents\.azure\.com$/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isCosmosAccountResourceId(value) {
+  return typeof value === 'string' &&
+    /^\/subscriptions\/[^/]+\/resourceGroups\/[^/]+\/providers\/Microsoft\.DocumentDB\/databaseAccounts\/[^/]+$/i.test(value);
+}

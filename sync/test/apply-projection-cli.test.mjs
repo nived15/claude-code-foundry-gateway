@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const script = fileURLToPath(new URL('../src/apply-projection.mjs', import.meta.url));
@@ -887,4 +887,138 @@ test('graph mode refuses missing or partial job settings before Azure work', () 
   assert.equal(noAccount.code, 1);
   assert.match(noAccount.json.error, /PROJECTION_ACCOUNT_RESOURCE_ID/);
   assert.match(noAccount.json.error, /Remedy:/);
+});
+
+// The access catalog: 47 Entra groups to profiles that carry their own models and token limits.
+const catalogId = `access-catalog::${tenant}`;
+const catalogGroupA = 'aaaaaaaa-0000-4000-8000-000000000001';
+const catalogGroupB = 'aaaaaaaa-0000-4000-8000-000000000022';
+function accessCatalog(overrides = {}) {
+  return {
+    id: catalogId, oid: catalogId, type: 'access-catalog', tenantId: tenant, catalogVersion: '2026-10-15.1',
+    multipleGroupRule: 'highest-monthly',
+    profiles: [
+      { id: 'standard-l1-ha-so', models: ',claude-haiku-4-5,claude-sonnet-5,', tokensPerMonth: 13888888, tokensPerDay: 1388888 },
+      { id: 'advanced-l2-ha-so-op', models: ',claude-haiku-4-5,claude-sonnet-5,claude-opus-5,', tokensPerMonth: 83333333, tokensPerDay: 8333333 },
+    ],
+    groups: [
+      { objectId: catalogGroupA, row: 1, profile: 'standard-l1-ha-so' },
+      { objectId: catalogGroupB, row: 22, profile: 'advanced-l2-ha-so-op' },
+    ],
+    ...overrides,
+  };
+}
+const catalogRecordFor = (oid, profile = accessCatalog().profiles[0]) => ({
+  oid, tier: 'catalog', businessUnit: '', profile: profile.id, models: profile.models, tokensPerMonth: profile.tokensPerMonth, tokensPerDay: profile.tokensPerDay,
+});
+
+test('a snapshot applied with --catalog stores the catalog document and catalog records', () => {
+  const user = '33333333-3333-4333-8333-333333333333';
+  const legacy = '44444444-4444-4444-8444-444444444444';
+  const dir = join(work, 'catalog-snapshot-input');
+  mkdirSync(dir, { recursive: true });
+  const catalogPath = join(dir, 'catalog.json');
+  writeFileSync(catalogPath, JSON.stringify(accessCatalog()));
+  const snap = fullSnapshot({ verifiedAt: new Date(Date.now() - 60_000).toISOString(), records: [catalogRecordFor(user)] });
+  const { result, summary, store } = runApplyWithFake({
+    name: 'catalog snapshot',
+    docs: { [`${legacy}|${legacy}`]: { id: legacy, oid: legacy, tenantId: tenant, tier: 'standard', businessUnit: '' } },
+    snapshot: snap,
+    args: ['--catalog', catalogPath],
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(summary.catalogVersion, '2026-10-15.1');
+  const docs = JSON.parse(readFileSync(store, 'utf8')).docs;
+  assert.equal(docs[`${catalogId}|${catalogId}`].type, 'access-catalog');
+  const written = docs[`${user}|${user}`];
+  assert.equal(written.tier, 'catalog');
+  assert.equal(written.profile, 'standard-l1-ha-so');
+  assert.equal(written.models, ',claude-haiku-4-5,claude-sonnet-5,');
+  assert.equal(written.tokensPerMonth, 13888888);
+  assert.equal(docs[`${legacy}|${legacy}`], undefined, 'the catalog is authoritative: a legacy record outside it is removed');
+});
+
+test('a catalog for another tenant, or without a snapshot, is refused before any write', () => {
+  const dir = join(work, 'catalog-refused-input');
+  mkdirSync(dir, { recursive: true });
+  const catalogPath = join(dir, 'catalog.json');
+  const otherTenant = '99999999-9999-4999-8999-999999999999';
+  writeFileSync(catalogPath, JSON.stringify(accessCatalog({ tenantId: otherTenant, id: `access-catalog::${otherTenant}`, oid: `access-catalog::${otherTenant}` })));
+  const snap = fullSnapshot({ verifiedAt: new Date(Date.now() - 60_000).toISOString(), records: [catalogRecordFor('33333333-3333-4333-8333-333333333333')] });
+  const { result, summary, store } = runApplyWithFake({ name: 'catalog other tenant', snapshot: snap, args: ['--catalog', catalogPath] });
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(summary.error, /access catalog refused/);
+  assert.deepEqual(JSON.parse(readFileSync(store, 'utf8')).docs, {});
+
+  const graphOnly = run(['--cosmos', cosmos, '--tenant', tenant, '--account-resource-id', account, '--catalog', catalogPath]);
+  assert.equal(graphOnly.code, 1);
+  assert.match(graphOnly.json.error, /--catalog is applied with --snapshot/);
+});
+
+test('the scheduled graph run follows the stored catalog instead of the tier groups', () => {
+  const dir = join(work, 'catalog-graph');
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  const store = join(dir, 'cosmos.json');
+  const log = join(dir, 'cosmos.log');
+  const one = '33333333-3333-4333-8333-000000000001';
+  const both = '33333333-3333-4333-8333-000000000002';
+  const tierOnly = '33333333-3333-4333-8333-000000000003';
+  writeFileSync(store, JSON.stringify({ docs: { [`${catalogId}|${catalogId}`]: accessCatalog() } }));
+  writeFileSync(log, '');
+  const tierGroup = '11111111-1111-4111-8111-111111111111';
+  const result = spawnSync(process.execPath, [
+    '--import', graphPreloadUrl, '--loader', loaderUrl, script,
+    '--cosmos', cosmos, '--tenant', tenant, '--account-resource-id', account,
+    '--graph', '--standard', tierGroup, '--premium', 'none',
+  ], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      FAKE_COSMOS_STORE: store,
+      FAKE_COSMOS_LOG: log,
+      FAKE_GRAPH_TENANT: tenant,
+      FAKE_GRAPH_ACCOUNT_RESOURCE_ID: account,
+      FAKE_GRAPH_GROUP_ID: tierGroup,
+      FAKE_GRAPH_USERS: tierOnly,
+      FAKE_GRAPH_GROUP_USERS: `${catalogGroupA}=${one}|${both};${catalogGroupB}=${both}`,
+      PROJECTION_ACCOUNT_RESOURCE_ID: '',
+      PROJECTION_STANDARD_GROUP_ID: '',
+      PROJECTION_PREMIUM_GROUP_ID: '',
+      PROJECTION_GATEWAY_RESOURCE_ID: '',
+    },
+  });
+  const summary = JSON.parse(result.stdout.trim().split(/\r?\n/).filter((line) => line.startsWith('{')).at(-1));
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(summary.catalogVersion, '2026-10-15.1');
+  assert.equal(summary.catalogConflicts, 1);
+  const docs = JSON.parse(readFileSync(store, 'utf8')).docs;
+  assert.equal(docs[`${one}|${one}`].profile, 'standard-l1-ha-so');
+  assert.equal(docs[`${both}|${both}`].profile, 'advanced-l2-ha-so-op');
+  assert.equal(docs[`${tierOnly}|${tierOnly}`], undefined, 'the tier group is not read once a catalog is stored');
+  assert.equal(docs[`${catalogId}|${catalogId}`].type, 'access-catalog', 'the catalog document is kept');
+});
+
+test('catalog records compare clean with their snapshot and pass the switch evidence check', () => {
+  const user = '33333333-3333-4333-8333-333333333333';
+  const dir = join(work, 'catalog-evidence-input');
+  mkdirSync(dir, { recursive: true });
+  const catalogPath = join(dir, 'catalog.json');
+  writeFileSync(catalogPath, JSON.stringify(accessCatalog()));
+  const snap = fullSnapshot({ verifiedAt: new Date(Date.now() - 60_000).toISOString(), records: [catalogRecordFor(user, accessCatalog().profiles[1])] });
+  const applied = runApplyWithFake({ name: 'catalog evidence', snapshot: snap, args: ['--catalog', catalogPath] });
+  assert.equal(applied.result.status, 0, applied.result.stdout + applied.result.stderr);
+  const env = { ...process.env, FAKE_COSMOS_STORE: applied.store, FAKE_COSMOS_LOG: applied.log, PROJECTION_ACCOUNT_RESOURCE_ID: '' };
+
+  const compare = spawnSync(process.execPath, ['--loader', loaderUrl, script, '--cosmos', cosmos, '--tenant', tenant, '--account-resource-id', account,
+    '--compare-snapshot', join(dirname(applied.store), 'snapshot.json')], { encoding: 'utf8', env });
+  const compared = JSON.parse(compare.stdout.trim().split(/\r?\n/).filter((line) => line.startsWith('{')).at(-1));
+  assert.equal(compare.status, 0, compare.stdout + compare.stderr);
+  assert.equal(compared.differences, 0, JSON.stringify(compared.sample));
+
+  const admission = spawnSync(process.execPath, ['--loader', loaderUrl, fileURLToPath(new URL('../src/check-admission.mjs', import.meta.url)),
+    '--cosmos', cosmos, '--tenant', tenant, '--account-resource-id', account], { encoding: 'utf8', env });
+  const evidence = JSON.parse(admission.stdout.trim().split(/\r?\n/).filter((line) => line.startsWith('{')).at(-1));
+  assert.equal(evidence.ok, true, admission.stdout + admission.stderr);
+  assert.equal(evidence.invalidCount, 0);
 });

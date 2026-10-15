@@ -72,7 +72,9 @@ $allowed = @(
 $allowedSignatures = @($allowed | ForEach-Object { $_.File + '|' + $_.Line })
 $unlistedEntries = @($hits | Where-Object { $_.Signature -notin $allowedSignatures })
 Assert 'the flow''s scripts use ordinal sorting or an exact documented exception' ($unlistedEntries.Count -eq 0) (@($unlistedEntries | ForEach-Object Location) -join ', ')
-$repoScripts = @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.ps1' -File | Where-Object { $_.FullName.Substring($root.Length + 1) -notmatch '^(tests|node_modules|\.git)\\' })
+# scripts\new-scripts holds byte-identical copies of scripts checked here (Test-ClaudeAccessBundle.ps1); a
+# dot-source is matched by file name, so its copies would otherwise be followed as well.
+$repoScripts = @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.ps1' -File | Where-Object { $_.FullName.Substring($root.Length + 1) -notmatch '^(tests|node_modules|\.git|scripts\\new-scripts)\\' })
 $closureRoots = @(@('Start-ClaudeGateway.ps1', 'scripts\Update-ClaudeGateway.ps1', 'scripts\Sync-ClaudeModels.ps1', 'Install-ClaudeGateway.ps1' | ForEach-Object { Join-Path $root $_ }) +
     @(Get-ChildItem -LiteralPath (Join-Path $root 'scripts\flow') -Recurse -Filter '*.ps1' -File | ForEach-Object { $_.FullName }))
 $closure = [ordered]@{}

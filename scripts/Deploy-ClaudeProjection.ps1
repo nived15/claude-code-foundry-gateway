@@ -11,7 +11,9 @@
     authoritative. With -FlipAfterCleanCompare it deploys, publishes and applies
     nothing: it runs Invoke-ClaudeProjectionSwitch (ADR-0050) with the projection
     prefix and switch evidence. PreflightOnly
-    runs the checks alone.
+    runs the checks alone. -InfrastructureOnly stops once the gateway points at the
+    resolver and the in-VNet runner can write the projection, for a caller that
+    populates it from somewhere other than the tier groups (Import-ClaudeAccessCatalog.ps1).
 
     BasicV2 must use a public resolver endpoint because Basic v2 has no
     outbound VNet integration. The public endpoint is not anonymous: App Service
@@ -34,6 +36,7 @@ param(
     [string]$PremiumGroup = 'claude-code-premium',
     [switch]$FlipAfterCleanCompare,
     [switch]$PreflightOnly,
+    [switch]$InfrastructureOnly,
     [ValidateSet('Auto','Snapshot')][string]$CompareBaseline = 'Auto',
     [switch]$ResolverPublicByDefault,
     [ValidateRange(1,10)][int]$RetryCount = 3,
@@ -41,6 +44,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($InfrastructureOnly -and $FlipAfterCleanCompare) { throw '-InfrastructureOnly deploys and -FlipAfterCleanCompare switches; run them separately. Nothing was changed.' }
 $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'ApimNamedValue.ps1')
 . (Join-Path $PSScriptRoot 'ClaudeRunner.ps1')
@@ -203,6 +207,19 @@ if ($PSCmdlet.ShouldProcess($ApimName, 'set resolver named values and entitlemen
     $null = Set-ClaudeProjectionGatewayResolver -ResourceGroup $ResourceGroup -ApimName $ApimName -NamePrefix $NamePrefix -ResolverUrl $resolverUrl -ResolverAudience $resolverAudience
 } else { throw 'Pointing the gateway at the resolver was declined; no further steps run.' }
 Ok "entitlement-resolver-url is $resolverUrl; entitlement-projection-prefix is $NamePrefix; entitlement-source is unchanged"
+
+Step 'Grant the in-VNet runner the entitlement container'
+if ($PSCmdlet.ShouldProcess($cosmosAccount, 'grant the runner Cosmos data contributor on /dbs/claude/colls/entitlement')) {
+    if (-not $network.runnerName -or -not $network.runnerPrincipalId) { throw 'Projection network did not return an in-VNet runner.' }
+    az cosmosdb sql role assignment create --account-name $cosmosAccount --resource-group $ResourceGroup `
+        --scope /dbs/claude/colls/entitlement --principal-id $($network.runnerPrincipalId) `
+        --role-definition-id 00000000-0000-0000-0000-000000000002 -o none 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'Runner Cosmos role assignment failed; projection apply was not attempted.' }
+} else { throw 'The runner grant was declined; no further steps run.' }
+if ($InfrastructureOnly) {
+    Note 'Infrastructure only: the projection was not populated and entitlement-source is unchanged.'
+    return
+}
 $work = Join-Path ([IO.Path]::GetTempPath()) ("claude-projection-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $snapshot = Join-Path $work 'snapshot.json'
@@ -215,11 +232,6 @@ try {
         & (Join-Path $PSScriptRoot 'Sync-ClaudeProjection.ps1') -Account $cosmosAccount -ApimName $ApimName -ResourceGroup $ResourceGroup `
             -StandardGroup $StandardGroup -PremiumGroup $PremiumGroup -ExportPath $snapshot
         if ($LASTEXITCODE -ne 0) { throw 'projection snapshot export failed' }
-        if (-not $network.runnerName -or -not $network.runnerPrincipalId) { throw 'Projection network did not return an in-VNet runner.' }
-        az cosmosdb sql role assignment create --account-name $cosmosAccount --resource-group $ResourceGroup `
-            --scope /dbs/claude/colls/entitlement --principal-id $($network.runnerPrincipalId) `
-            --role-definition-id 00000000-0000-0000-0000-000000000002 -o none 2>$null
-        if ($LASTEXITCODE -ne 0) { throw 'Runner Cosmos role assignment failed; projection apply was not attempted.' }
         $null = New-ClaudeProjectionSyncArchive -Path $syncArchive -Root $root
         Start-ClaudeProjectionRunner -ResourceGroup $ResourceGroup -Name $($network.runnerName) -SubscriptionId $SubscriptionId | Out-Null
         Send-RunnerFile -ResourceGroup $ResourceGroup -Name $($network.runnerName) -Path $syncArchive -Destination /work/sync-source.tar.gz | Out-Null

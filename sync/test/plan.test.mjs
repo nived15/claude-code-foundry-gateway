@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeMembership, planChanges, removalLimit, removalLimitExceeded, toDocument, validateSnapshot, validateTargetedSnapshot, compareWithSnapshot, createReconciliation } from '../src/plan.mjs';
+import { mergeMembership, planChanges, removalLimit, removalLimitExceeded, toDocument, validateSnapshot, validateTargetedSnapshot, compareWithSnapshot, createReconciliation,
+  accessCatalogId, ACCESS_CATALOG_TYPE, validateAccessCatalog, resolveCatalogRecords, isControlRecord } from '../src/plan.mjs';
 const lease = createReconciliation({ verifiedAt: new Date() });
 
 const A = '11111111-1111-1111-1111-111111111111';
@@ -174,4 +175,101 @@ test('full snapshot comparison uses resolver validation and reports tier and uni
     [C]: 'would-delete-record',
   });
   assert.match(compareWithSnapshot({ ...snap, scope: 'user' }, live, { tenantId: T }).problems.join(), /full snapshot/);
+});
+
+// Access catalog: groups map to profiles that carry their own models and limits.
+const G1 = 'aaaaaaaa-0000-0000-0000-000000000001';
+const G22 = 'aaaaaaaa-0000-0000-0000-000000000022';
+const G43 = 'aaaaaaaa-0000-0000-0000-000000000043';
+const G46 = 'aaaaaaaa-0000-0000-0000-000000000046';
+const catalog = (rule = 'highest-monthly') => ({
+  id: accessCatalogId(T), oid: accessCatalogId(T), type: ACCESS_CATALOG_TYPE, tenantId: T, catalogVersion: '2026-10-15.1',
+  multipleGroupRule: rule,
+  profiles: [
+    { id: 'standard-l1-ha-so', models: ',claude-haiku-4-5,claude-sonnet-5,', tokensPerMonth: 13888888, tokensPerDay: 1388888 },
+    { id: 'advanced-l2-ha-so-op', models: ',claude-haiku-4-5,claude-sonnet-5,claude-opus-5,', tokensPerMonth: 83333333, tokensPerDay: 8333333 },
+    { id: 'power-l1-ha-so-op', models: ',claude-haiku-4-5,claude-sonnet-5,claude-opus-5,', tokensPerMonth: 277777777, tokensPerDay: 27777777 },
+  ],
+  groups: [
+    { objectId: G1, row: 1, profile: 'standard-l1-ha-so' },
+    { objectId: G22, row: 22, profile: 'advanced-l2-ha-so-op' },
+    { objectId: G43, row: 43, profile: 'power-l1-ha-so-op' },
+    { objectId: G46, row: 46, profile: 'power-l1-ha-so-op' },
+  ],
+});
+const members = { [G1]: [{ oid: A }, { oid: B }], [G22]: [{ oid: B }], [G43]: [{ oid: C }], [G46]: [{ oid: C }] };
+
+test('a valid access catalog has no problems, and a broken one is refused', () => {
+  assert.deepEqual(validateAccessCatalog(catalog(), { tenantId: T }), []);
+  assert.match(validateAccessCatalog({ ...catalog(), tenantId: B }, { tenantId: T }).join(), /tenant/);
+  assert.match(validateAccessCatalog({ ...catalog(), multipleGroupRule: 'first' }, { tenantId: T }).join(), /multipleGroupRule/);
+  const unknownProfile = catalog();
+  unknownProfile.groups[0].profile = 'standard-l9';
+  assert.match(validateAccessCatalog(unknownProfile, { tenantId: T }).join(), /standard-l9/);
+  const allowAll = catalog();
+  allowAll.profiles[0].models = ',,';
+  assert.match(validateAccessCatalog(allowAll, { tenantId: T }).join(), /model allowlist/);
+  const twice = catalog();
+  twice.groups[1].objectId = G1;
+  assert.match(validateAccessCatalog(twice, { tenantId: T }).join(), /twice/);
+});
+
+test('catalog membership resolves one profile per person, the larger allowance winning a tie on the lower row', () => {
+  const { records, conflicts, denied } = resolveCatalogRecords(catalog(), members);
+  const byOid = Object.fromEntries(records.map((r) => [r.oid, r]));
+  assert.deepEqual(Object.keys(byOid).sort(), [A, B, C].sort());
+  assert.equal(byOid[A].profile, 'standard-l1-ha-so');
+  assert.equal(byOid[B].profile, 'advanced-l2-ha-so-op');
+  assert.equal(byOid[C].profile, 'power-l1-ha-so-op');
+  assert.equal(byOid[B].tier, 'catalog');
+  assert.equal(byOid[B].models, ',claude-haiku-4-5,claude-sonnet-5,claude-opus-5,');
+  assert.equal(byOid[B].tokensPerMonth, 83333333);
+  assert.equal(byOid[B].tokensPerDay, 8333333);
+  assert.equal(byOid[B].businessUnit, '');
+  assert.deepEqual(conflicts.map((c) => c.oid).sort(), [B, C].sort());
+  assert.deepEqual(denied, []);
+});
+
+test('the deny rule leaves anyone in two groups without a record', () => {
+  const { records, denied } = resolveCatalogRecords(catalog('deny'), members);
+  assert.deepEqual(records.map((r) => r.oid), [A]);
+  assert.deepEqual(denied.sort(), [B, C].sort());
+});
+
+test('catalog records are snapshot-valid, rewritten when a limit changes and stored with their fields', () => {
+  const { records } = resolveCatalogRecords(catalog(), members);
+  const snap = { kind: 'claude-entitlement-snapshot', tenantId: T, ...lease, records };
+  assert.deepEqual(validateSnapshot(snap, { tenantId: T }), []);
+  assert.match(validateSnapshot({ ...snap, records: [{ ...records[0], models: ',,' }] }, { tenantId: T }).join(), /model allowlist/);
+
+  const a = records.find((r) => r.oid === A);
+  const same = new Map([[A, { tier: 'catalog', businessUnit: '', profile: a.profile, models: a.models, tokensPerMonth: a.tokensPerMonth, tokensPerDay: a.tokensPerDay }]]);
+  assert.equal(planChanges([a], same).unchanged, 1);
+  const raised = new Map([[A, { ...same.get(A), tokensPerMonth: 1 }]]);
+  assert.equal(planChanges([a], raised).toWrite.length, 1);
+  const legacy = new Map([[A, { tier: 'standard', businessUnit: '' }]]);
+  assert.equal(planChanges([a], legacy).toWrite.length, 1);
+
+  const doc = toDocument(a, { tenantId: T, mappingVersion: 1, reconciliation: lease });
+  assert.equal(doc.tier, 'catalog');
+  assert.equal(doc.profile, a.profile);
+  assert.equal(doc.models, a.models);
+  assert.equal(doc.tokensPerMonth, a.tokensPerMonth);
+  assert.equal(doc.tokensPerDay, a.tokensPerDay);
+  assert.equal('profile' in toDocument({ oid: B, tier: 'standard' }, { tenantId: T, mappingVersion: 1, reconciliation: lease }), false);
+});
+
+test('the catalog document is control data: never an orphan, never entitlement', () => {
+  assert.equal(isControlRecord(catalog()), true);
+  const existing = new Map([[A, { tier: 'standard', businessUnit: '' }], [accessCatalogId(T), { type: ACCESS_CATALOG_TYPE }]]);
+  assert.deepEqual(planChanges([{ oid: B, tier: 'standard' }], existing).toDelete, [A]);
+});
+
+test('snapshot comparison reports a profile change as drift', () => {
+  const { records } = resolveCatalogRecords(catalog(), members);
+  const snap = { kind: 'claude-entitlement-snapshot', tenantId: T, scope: 'full', ...lease, records };
+  const live = records.map((r) => ({ ...toDocument(r, { tenantId: T, mappingVersion: 1, reconciliation: lease }) }));
+  assert.equal(compareWithSnapshot(snap, live, { tenantId: T }).differences.length, 0);
+  live[0] = { ...live[0], profile: 'power-l1-ha-so-op', tokensPerMonth: 277777777, tokensPerDay: 27777777 };
+  assert.deepEqual(compareWithSnapshot(snap, live, { tenantId: T }).differences.map((d) => d.kind), ['tier-drift']);
 });

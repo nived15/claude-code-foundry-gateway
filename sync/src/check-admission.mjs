@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { evaluateProjectionAdmission, statusPartitionKey, STATUS_RECORD_TYPE } from './plan.mjs';
+import { evaluateProjectionAdmission, statusPartitionKey, STATUS_RECORD_TYPE, CATALOG_FIELDS } from './plan.mjs';
 
 const argv = process.argv.slice(2);
 const opt = (name, fallback) => {
@@ -46,7 +46,7 @@ while (it.hasMoreResults()) {
 }
 
 const entitlementRecords = [];
-const entitlementIterator = container.items.query('SELECT c.id, c.oid, c.tenantId, c.tier, c.businessUnit, c.mappingVersion, c.effectiveFrom, c.reconciliationGeneration, c.lastVerifiedAt, c.expiresAt, c.type FROM c', { maxItemCount: 1000 });
+const entitlementIterator = container.items.query(`SELECT c.id, c.oid, c.tenantId, c.tier, c.businessUnit, c.mappingVersion, c.effectiveFrom, c.reconciliationGeneration, c.lastVerifiedAt, c.expiresAt, c.type, ${CATALOG_FIELDS.map((f) => `c.${f}`).join(', ')} FROM c`, { maxItemCount: 1000 });
 while (entitlementIterator.hasMoreResults()) {
   const { resources } = await entitlementIterator.fetchNext();
   entitlementRecords.push(...(resources ?? []).filter((r) => r.type === undefined));

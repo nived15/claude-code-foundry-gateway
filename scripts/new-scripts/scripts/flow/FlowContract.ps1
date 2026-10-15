@@ -1,0 +1,446 @@
+<#
+.SYNOPSIS
+    The guided flow's shared contract (ADR-0030): plans, costs, fingerprints, the decision record
+    and step ordering. Dot-source this; it makes no Azure calls.
+#>
+
+$script:ClaudeFlowVerbs = @('Create', 'Update', 'Delete', 'Grant', 'Revoke', 'Deploy', 'Run', 'Write', 'Migrate', 'Check')
+
+function New-ClaudeFlowAction {
+    param(
+        [Parameter(Mandatory = $true)][string]$Verb,
+        [Parameter(Mandatory = $true)][string]$Target,
+        [string]$Detail = ''
+    )
+    if ($Verb -notin $script:ClaudeFlowVerbs) { throw "Unknown flow verb '$Verb'. Use one of: $($script:ClaudeFlowVerbs -join ', ')." }
+    [pscustomobject][ordered]@{ Verb = $Verb; Target = $Target; Detail = $Detail }
+}
+
+function New-ClaudeFlowCost {
+    param(
+        [Parameter(Mandatory = $true)][string]$Item,
+        [Nullable[decimal]]$MonthlyUsd = $null,
+        [Parameter(Mandatory = $true)][string]$Source,
+        [string]$RetrievedUtc = '',
+        [string]$UnknownReason = ''
+    )
+    if ($null -ne $MonthlyUsd -and $MonthlyUsd -lt 0) { throw "Cost '$Item' is negative." }
+    if ($null -eq $MonthlyUsd -and -not $UnknownReason) { throw "Cost '$Item' has no amount; give the reason it is unknown (-UnknownReason)." }
+    [pscustomobject][ordered]@{
+        Item = $Item
+        MonthlyUsd = $MonthlyUsd
+        Source = $Source
+        RetrievedUtc = $RetrievedUtc
+        UnknownReason = $UnknownReason
+    }
+}
+
+function New-ClaudeFlowPlan {
+    param(
+        [string]$Step,
+        [string]$Summary = '',
+        [object[]]$Actions = @(),
+        [object[]]$Costs = @(),
+        [string[]]$Implications = @(),
+        [string[]]$Requires = @(),
+        [bool]$Reversible = $true,
+        [string]$Rollback = '',
+        [hashtable]$Data = @{}
+    )
+    if (-not $Step) { throw 'A flow plan needs a step name.' }
+    [pscustomobject][ordered]@{
+        Step = $Step
+        Summary = $Summary
+        Actions = @($Actions)
+        Costs = @($Costs)
+        Implications = @($Implications)
+        Requires = @($Requires)
+        Reversible = $Reversible
+        Rollback = $Rollback
+        Data = $Data
+    }
+}
+
+function Test-ClaudeFlowPlanIsNoop {
+    param([Parameter(Mandatory = $true)]$Plan)
+    return (@($Plan.Actions).Count -eq 0)
+}
+
+function Get-ClaudeFlowTotalMonthlyUsd {
+    param([object[]]$Plans = @())
+    [decimal]$known = 0
+    $unknown = [System.Collections.Generic.List[string]]::new()
+    foreach ($plan in $Plans) {
+        foreach ($cost in @($plan.Costs)) {
+            if ($null -ne $cost.MonthlyUsd) { $known += [decimal]$cost.MonthlyUsd }
+            else { $unknown.Add("$($cost.Item) ($($cost.UnknownReason))") }
+        }
+    }
+    [pscustomobject]@{ KnownMonthlyUsd = $known; Unknown = @($unknown) }
+}
+
+function Test-ClaudeFlowOrdinalNumber {
+    param($Value)
+    return ($Value -is [int] -or $Value -is [long] -or $Value -is [decimal] -or $Value -is [double] -or $Value -is [single] -or
+        $Value -is [int16] -or $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [uint16] -or $Value -is [uint32] -or $Value -is [uint64])
+}
+
+function ConvertTo-ClaudeFlowOrdinalKey {
+    # Strings, numbers, times and versions are kept as they are; anything else becomes its string.
+    param($Value)
+    if ($null -eq $Value -or $Value -is [string] -or (Test-ClaudeFlowOrdinalNumber $Value) -or $Value -is [datetime] -or
+        $Value -is [datetimeoffset] -or $Value -is [timespan] -or $Value -is [version]) { return $Value }
+    if ($Value -is [bool]) { return [int]$Value }
+    return [string]$Value
+}
+
+function Compare-ClaudeFlowOrdinalKey {
+    # Strings by code point; numbers, times and versions by value; $null first; other pairs by the
+    # code points of their strings. No comparison here depends on the culture or the shell.
+    param($A, $B)
+    if ($null -eq $A) { if ($null -eq $B) { return 0 }; return -1 }
+    if ($null -eq $B) { return 1 }
+    if ($A -is [string] -and $B -is [string]) { return [Math]::Sign([string]::CompareOrdinal($A, $B)) }
+    $numberA = Test-ClaudeFlowOrdinalNumber $A; $numberB = Test-ClaudeFlowOrdinalNumber $B
+    if ($numberA -and $numberB) {
+        if ($A -is [double] -or $A -is [single] -or $B -is [double] -or $B -is [single]) { return [Math]::Sign(([double]$A).CompareTo([double]$B)) }
+        return [decimal]::Compare([decimal]$A, [decimal]$B)
+    }
+    if (-not $numberA -and -not $numberB -and $A -isnot [string] -and $B -isnot [string] -and $A.GetType() -eq $B.GetType() -and $A -is [System.IComparable]) {
+        return [Math]::Sign($A.CompareTo($B))
+    }
+    return [Math]::Sign([string]::CompareOrdinal([string]$A, [string]$B))
+}
+
+function Sort-ClaudeFlowOrdinal {
+    # Code-point order, ignoring case as Sort-Object does, the same on Windows PowerShell 5.1 and
+    # PowerShell 7. Sort-Object compares strings by culture, and .NET Framework (NLS) and .NET (ICU)
+    # weigh a hyphen differently, so one list had two orders and one plan two fingerprints (P76).
+    # -Key takes what Sort-Object's -Property takes: script blocks, property names, or hashtables with
+    # Expression and Descending. Strings compare by code point ignoring case; numbers,
+    # times and versions by value. Items equal on every key ignoring case are ordered by the keys'
+    # code points, then by input position, so the order never depends on the sort algorithm. The keys
+    # are compared as values, not joined: a separator character inside a key would reorder it.
+    # -Unique keeps the first item of each key ignoring case.
+    param([object[]]$InputObject = @(), [object[]]$Key = @({ [string]$_ }), [switch]$Descending, [switch]$Unique)
+    $items = @($InputObject | Where-Object { $null -ne $_ })
+    if (-not $items.Count) { return }
+    $specs = @(foreach ($k in @($Key)) {
+        $expression = $k; $down = [bool]$Descending
+        if ($k -is [System.Collections.IDictionary]) {
+            $expression = $k['Expression']
+            if ($k.Contains('Descending')) { $down = [bool]$k['Descending'] }
+        }
+        if ($expression -isnot [scriptblock] -and -not ($expression -is [string] -and $expression)) {
+            throw 'Sort-ClaudeFlowOrdinal: a key is a script block, a property name, or a hashtable whose Expression is one of those.'
+        }
+        [pscustomobject]@{ Expression = $expression; Down = $down }
+    })
+    $entries = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $raw = New-Object 'object[]' $specs.Count
+        $folded = New-Object 'object[]' $specs.Count
+        for ($n = 0; $n -lt $specs.Count; $n++) {
+            $expression = $specs[$n].Expression
+            $value = if ($expression -is [scriptblock]) { $items[$i] | ForEach-Object $expression } else { $items[$i].$expression }
+            $value = ConvertTo-ClaudeFlowOrdinalKey $value
+            $raw[$n] = $value
+            $folded[$n] = if ($value -is [string]) { $value.ToUpperInvariant() } else { $value }
+        }
+        $entries.Add([pscustomobject]@{ Folded = $folded; Raw = $raw; Index = $i; Item = $items[$i] })
+    }
+    $directions = @($specs | ForEach-Object { $_.Down })
+    $entries.Sort([System.Comparison[object]]{
+        param($x, $y)
+        $xs = $x.Folded; $ys = $y.Folded
+        for ($n = 0; $n -lt $directions.Count; $n++) {
+            $c = Compare-ClaudeFlowOrdinalKey $xs[$n] $ys[$n]
+            if ($c -ne 0) { if ($directions[$n]) { return -$c }; return $c }
+        }
+        $xs = $x.Raw; $ys = $y.Raw
+        for ($n = 0; $n -lt $directions.Count; $n++) {
+            $c = Compare-ClaudeFlowOrdinalKey $xs[$n] $ys[$n]
+            if ($c -ne 0) { if ($directions[$n]) { return -$c }; return $c }
+        }
+        return $x.Index.CompareTo($y.Index)
+    })
+    $kept = [System.Collections.Generic.List[object]]::new()
+    $previous = $null
+    foreach ($e in $entries) {
+        $same = $null -ne $previous
+        if ($same) { for ($n = 0; $n -lt $directions.Count; $n++) { if ((Compare-ClaudeFlowOrdinalKey $e.Folded[$n] $previous[$n]) -ne 0) { $same = $false; break } } }
+        if (-not $Unique -or -not $same) { $kept.Add($e.Item) }
+        $previous = $e.Folded
+    }
+    return $kept.ToArray()
+}
+
+function ConvertTo-ClaudeFlowJsonString {
+    # A JSON string written the same way on every shell. ConvertTo-Json escapes ' < > & as \u0027 on
+    # Windows PowerShell 5.1 and not on PowerShell 7, which gave one plan two fingerprints (P72).
+    param([string]$Text)
+    $sb = New-Object System.Text.StringBuilder ($Text.Length + 2)
+    [void]$sb.Append('"')
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int]$ch
+        if ($ch -eq '"') { [void]$sb.Append('\"') }
+        elseif ($ch -eq '\') { [void]$sb.Append('\\') }
+        elseif ($code -lt 0x20 -or $code -gt 0x7e) { [void]$sb.Append(('\u{0:x4}' -f $code)) }
+        else { [void]$sb.Append($ch) }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function ConvertTo-ClaudeFlowCanonical {
+    # Sorted keys and invariant number formatting, so a fingerprint does not depend on property
+    # order, culture or shell. RetrievedUtc is left out: re-reading an unchanged price is not a new plan.
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [string]) { return (ConvertTo-ClaudeFlowJsonString $Value) }
+    if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+    if ($Value -is [decimal] -or $Value -is [double] -or $Value -is [int] -or $Value -is [long]) { return ([decimal]$Value).ToString('0.############', [Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [System.Collections.IDictionary]) {
+        # Ordinal: Sort-Object compares by culture, and .NET Framework and .NET sort punctuation differently.
+        [string[]]$keys = @($Value.Keys | ForEach-Object { [string]$_ })
+        [Array]::Sort($keys, [StringComparer]::Ordinal)
+        $pairs = foreach ($k in $keys) {
+            if ($k -eq 'RetrievedUtc') { continue }
+            (ConvertTo-ClaudeFlowJsonString $k) + ':' + (ConvertTo-ClaudeFlowCanonical $Value[$k])
+        }
+        return '{' + ($pairs -join ',') + '}'
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        return '[' + ((@($Value) | ForEach-Object { ConvertTo-ClaudeFlowCanonical $_ }) -join ',') + ']'
+    }
+    if ($Value -is [pscustomobject]) {
+        $table = [ordered]@{}
+        foreach ($p in $Value.PSObject.Properties) { $table[$p.Name] = $p.Value }
+        return ConvertTo-ClaudeFlowCanonical $table
+    }
+    return (ConvertTo-ClaudeFlowJsonString ([string]$Value))
+}
+
+function Get-ClaudeFlowFingerprint {
+    param([object[]]$Plans = @())
+    $text = ConvertTo-ClaudeFlowCanonical @($Plans)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text)) } finally { $sha.Dispose() }
+    return (-join ($bytes | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Resolve-ClaudeFlowFilePath {
+    # .NET file methods resolve a relative path against the process's start directory, which `cd` in
+    # PowerShell does not change (P79): a relative path here means PowerShell's current folder.
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
+function Read-ClaudeDecisionRecord {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $Path = Resolve-ClaudeFlowFilePath $Path
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $text = [IO.File]::ReadAllText($Path)
+    try { return ($text | ConvertFrom-Json) }
+    catch { throw "The decision record '$Path' is not valid JSON; fix or restore it before running the flow: $($_.Exception.Message)" }
+}
+
+function Copy-ClaudeFlowValue {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $copy=[ordered]@{}
+        foreach($key in $Value.Keys){$copy[[string]$key]=Copy-ClaudeFlowValue $Value[$key]}
+        return [pscustomobject]$copy
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items=New-Object 'Collections.Generic.List[object]'
+        foreach($item in $Value){$items.Add((Copy-ClaudeFlowValue $item))}
+        return ,$items.ToArray()
+    }
+    if ($Value -is [pscustomobject]) {
+        $copy=[ordered]@{}
+        foreach($p in $Value.PSObject.Properties){$copy[$p.Name]=Copy-ClaudeFlowValue $p.Value}
+        return [pscustomobject]$copy
+    }
+    return $Value
+}
+
+function Get-ClaudeDecisionRecordVersion {
+    param([Parameter(Mandatory = $true)]$Record)
+    if ($Record.PSObject.Properties.Name -contains 'schemaVersion') { return [int]$Record.schemaVersion }
+    return 1
+}
+
+function Set-ClaudeRecordProperty {
+    param($Object, [string]$Name, $Value)
+    if ($Object.PSObject.Properties.Name -contains $Name) { $Object.$Name = $Value }
+    else { $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
+}
+
+function Set-ClaudeDecision {
+    param([Parameter(Mandatory = $true)]$Record, [Parameter(Mandatory = $true)][string]$Key, $Value)
+    Set-ClaudeRecordProperty $Record 'schemaVersion' 2
+    if (-not ($Record.PSObject.Properties.Name -contains 'decisions') -or $null -eq $Record.decisions) {
+        Set-ClaudeRecordProperty $Record 'decisions' ([pscustomobject]@{})
+    }
+    $stored = if ($Value -is [System.Collections.IDictionary]) { [pscustomobject]$Value } else { $Value }
+    Set-ClaudeRecordProperty $Record.decisions $Key $stored
+}
+
+function Get-ClaudeDecision {
+    param([Parameter(Mandatory = $true)]$Record, [Parameter(Mandatory = $true)][string]$Key)
+    if (-not ($Record.PSObject.Properties.Name -contains 'decisions') -or $null -eq $Record.decisions) { return $null }
+    if ($Record.decisions.PSObject.Properties.Name -contains $Key) { return $Record.decisions.$Key }
+    return $null
+}
+
+function Add-ClaudeDecisionHistory {
+    param(
+        [Parameter(Mandatory = $true)]$Record,
+        [Parameter(Mandatory = $true)][string]$Action,
+        [string]$Decision = '',
+        $From = $null,
+        $To = $null,
+        [string]$Principal = '',
+        [string]$Commit = ''
+    )
+    Set-ClaudeRecordProperty $Record 'schemaVersion' 2
+    $history = [System.Collections.Generic.List[object]]::new()
+    if ($Record.PSObject.Properties.Name -contains 'history' -and $null -ne $Record.history) {
+        foreach ($entry in @($Record.history)) { $history.Add($entry) }
+    }
+    $history.Add([pscustomobject][ordered]@{
+        utc = [DateTime]::UtcNow.ToString('o')
+        action = $Action
+        decision = $Decision
+        from = $From
+        to = $To
+        by = $Principal
+        commit = $Commit
+    })
+    Set-ClaudeRecordProperty $Record 'history' ([object[]]$history.ToArray())
+}
+
+function Set-ClaudeDecisionRelease {
+    param([Parameter(Mandatory = $true)]$Record, [string]$Version = '', [string]$Commit = '')
+    Set-ClaudeRecordProperty $Record 'schemaVersion' 2
+    Set-ClaudeRecordProperty $Record 'release' ([pscustomobject][ordered]@{ version = $Version; commit = $Commit; appliedUtc = [DateTime]::UtcNow.ToString('o') })
+}
+
+function Write-ClaudeDecisionRecord {
+    # Written beside the target and moved over it, so an interrupted write never leaves a half
+    # record behind.
+    param([Parameter(Mandatory = $true)]$Record, [Parameter(Mandatory = $true)][string]$Path)
+    $Path = Resolve-ClaudeFlowFilePath $Path
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $temp = "$Path.tmp-$([guid]::NewGuid().ToString('N'))"
+    try {
+        [IO.File]::WriteAllText($temp, ($Record | ConvertTo-Json -Depth 30), (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $temp -Destination $Path -Force
+    }
+    finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }
+}
+
+function Get-ClaudeFlowReleaseInfo {
+    param([string]$Repo = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent))
+    # A copy without git, or not in a repository, records no commit instead of stopping the apply.
+    # Continue: on Windows PowerShell 5.1 git's stderr under Stop is a terminating NativeCommandError.
+    $commit = ''; $version = ''
+    if (Get-Command git -CommandType Application -ErrorAction SilentlyContinue) {
+        $saved = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $commit = [string](git -C $Repo rev-parse HEAD 2>$null)
+            if ($LASTEXITCODE -ne 0) { $commit = '' }
+            $version = [string](git -C $Repo describe --tags --always 2>$null)
+            if ($LASTEXITCODE -ne 0) { $version = '' }
+        }
+        catch { $commit = ''; $version = '' }
+        finally { $ErrorActionPreference = $saved }
+    }
+    [pscustomobject]@{ version = $version; commit = $commit }
+}
+
+function Get-ClaudeFlowRecordSubscription {
+    # The one subscription the record names: top level first, then the foundation decision. Discovery
+    # and the installer both use it, so they read and write the same subscription (ADR-0032).
+    param($Record)
+    if ($null -eq $Record) { return '' }
+    if ($Record.PSObject.Properties.Name -contains 'subscriptionId' -and $Record.subscriptionId) { return ([string]$Record.subscriptionId).Trim() }
+    $decision = Get-ClaudeDecision -Record $Record -Key foundation
+    if ($decision -and $decision.PSObject.Properties.Name -contains 'subscriptionId' -and $decision.subscriptionId) { return ([string]$decision.subscriptionId).Trim() }
+    return ''
+}
+
+function Test-ClaudeFlowSubscriptionId {
+    param([string]$Value)
+    return ($Value -match '^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$')
+}
+
+function Test-ClaudeFlowAzCmdShim {
+    # On Windows az is az.cmd, and cmd.exe re-reads & | < > ^ ( ) " % in the arguments it is given.
+    $az = Get-Command az -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    return [bool]($az -and $az.Source -match '\.(cmd|bat)$')
+}
+
+function ConvertTo-ClaudeFlowCommandArgument {
+    # A value in a command printed for the operator to paste into PowerShell: a plain token as it is, anything
+    # else single-quoted with every single-quote character doubled. PowerShell also reads U+2018-U+201B as single
+    # quotes, and a value that starts with '-' would bind as a parameter (the installer's
+    # Format-ClaudeInstallerCommandValue, P98 council round 2).
+    param([AllowEmptyString()][string]$Value)
+    if ($Value -cmatch '^[A-Za-z0-9][A-Za-z0-9._:\\/-]*$') { return $Value }
+    return "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Value) + "'"
+}
+
+function Get-ClaudeFlowStepOrder {
+    # Dependencies first; steps with no order between them keep the order they were given in.
+    param([object[]]$Steps = @())
+    $byName = @{}
+    foreach ($s in $Steps) { $byName[$s.Name] = $s }
+    foreach ($s in $Steps) {
+        foreach ($d in @($s.DependsOn)) {
+            if ($d -and -not $byName.ContainsKey($d)) { throw "Step '$($s.Name)' depends on unknown step '$d'." }
+        }
+    }
+    $state = @{}
+    $ordered = [System.Collections.Generic.List[object]]::new()
+    $visit = $null
+    $visit = {
+        param($name)
+        if ($state[$name] -eq 'done') { return }
+        if ($state[$name] -eq 'visiting') { throw "Flow steps form a dependency cycle through '$name'." }
+        $state[$name] = 'visiting'
+        foreach ($d in @($byName[$name].DependsOn)) { if ($d) { & $visit $d } }
+        $state[$name] = 'done'
+        $ordered.Add($byName[$name])
+    }
+    foreach ($s in $Steps) { & $visit $s.Name }
+    return @($ordered)
+}
+
+function Format-ClaudeFlowReview {
+    param([object[]]$Plans = @())
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($plan in $Plans) {
+        $lines.Add('')
+        $lines.Add("[$($plan.Step)] $($plan.Summary)")
+        if (Test-ClaudeFlowPlanIsNoop $plan) { $lines.Add('  no change'); continue }
+        foreach ($a in $plan.Actions) { $lines.Add("  $($a.Verb.PadRight(8)) $($a.Target)$(if ($a.Detail) { " - $($a.Detail)" })") }
+        foreach ($c in $plan.Costs) {
+            $amount = if ($null -ne $c.MonthlyUsd) { '$' + ([decimal]$c.MonthlyUsd).ToString('N2', $inv) + '/month' } else { "unknown ($($c.UnknownReason))" }
+            $lines.Add("  cost     $($c.Item): $amount [$($c.Source)]")
+        }
+        foreach ($i in $plan.Implications) { $lines.Add("  note     $i") }
+        if (@($plan.Requires).Count) { $lines.Add("  needs    $($plan.Requires -join ', ')") }
+        $lines.Add("  undo     $(if ($plan.Reversible) { $plan.Rollback } else { "not reversible: $($plan.Rollback)" })")
+    }
+    $total = Get-ClaudeFlowTotalMonthlyUsd -Plans $Plans
+    $lines.Add('')
+    $lines.Add("Known monthly cost at list price: `$$($total.KnownMonthlyUsd.ToString('N2', $inv))")
+    foreach ($u in $total.Unknown) { $lines.Add("  plus $u") }
+    return ($lines -join [Environment]::NewLine)
+}

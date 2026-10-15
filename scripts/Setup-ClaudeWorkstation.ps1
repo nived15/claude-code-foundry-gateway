@@ -25,7 +25,12 @@
 
 .PARAMETER ConfigPath
     Path or URL to the claude-gateway.json your platform team sent you. Supplies
-    the gateway URL and tenant id so you do not have to type either.
+    the gateway URL and tenant id so you do not have to type either. When omitted,
+    the LTM gateway configuration embedded in this script is used.
+
+.EXAMPLE
+    # LTM: uses the embedded gateway configuration
+    ./Setup-ClaudeWorkstation.ps1
 
 .EXAMPLE
     ./Setup-ClaudeWorkstation.ps1 -ConfigPath .\claude-gateway.json
@@ -61,6 +66,42 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# LTM gateway record (claude-gateway.json, generated 2026-10-01), limited to the fields this script reads.
+$EmbeddedGatewayConfig = @'
+{
+  "mode": "gateway",
+  "gatewayUrl": "https://aigateway.ltm.com/claude",
+  "tenantId": "ff355289-721e-4dd7-a663-afec62ab9d54",
+  "authMode": "interactive",
+  "desktopSignIn": {
+    "kind": "external-idp",
+    "flow": "browser",
+    "bearerTokenType": "id_token",
+    "clientId": "93653a29-9e92-471a-960b-a3dbd5c58b78",
+    "issuer": "https://login.microsoftonline.com/ff355289-721e-4dd7-a663-afec62ab9d54/v2.0"
+  },
+  "deployments": [
+    { "name": "claude-haiku-4-5",  "model": "claude-haiku-4-5",  "version": "2" },
+    { "name": "claude-sonnet-5-5", "model": "claude-sonnet-5-5", "version": "2" },
+    { "name": "claude-opus-5-5",   "model": "claude-opus-5-5",   "version": "2" }
+  ],
+  "models": [ "claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5" ],
+  "tiers": {
+    "premium": {
+      "models": [ "claude-haiku-4-5", "claude-opus-5-5", "claude-sonnet-5-5" ],
+      "tokensPerDay": 1000000,
+      "tokensPerMinute": 50000
+    },
+    "standard": {
+      "models": [ "claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5" ],
+      "tokensPerDay": 500000,
+      "tokensPerMinute": 20000
+    }
+  }
+}
+'@
+
 # ClaudeClientSupport.ps1 and ClaudeDesktopSignIn.ps1 define what the steps below call; without
 # them the setup would fail halfway with an unknown command, so it stops here and says why.
 $missingHelpers = @('ClaudeClientSupport.ps1', 'ClaudeDesktopSignIn.ps1' | Where-Object { -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $_)) })
@@ -118,6 +159,15 @@ if ($ConfigPath) {
         }
     }
     catch { Write-Warn2 "Could not read $ConfigPath - $($_.Exception.Message)" }
+}
+else {
+    $cfg = $EmbeddedGatewayConfig | ConvertFrom-Json
+    if (-not $GatewayUrl) { $GatewayUrl = $cfg.gatewayUrl }
+    if (-not $TenantId)   { $TenantId = $cfg.tenantId }
+    Write-Ok 'loaded the embedded LTM gateway configuration'
+    if ($cfg.tiers.standard) {
+        Write-Note ("standard tier: {0:n0} tokens/min, {1:n0} tokens/day" -f $cfg.tiers.standard.tokensPerMinute, $cfg.tiers.standard.tokensPerDay)
+    }
 }
 if (-not $GatewayUrl) {
     Write-Host ''

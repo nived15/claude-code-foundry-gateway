@@ -19,6 +19,37 @@
 export const KNOWN_TIERS = ['standard', 'premium'];
 
 /**
+ * A record whose limits it carries itself: profile, model allowlist, and monthly and daily token quotas,
+ * written by the sync from the access catalog. The policy enforces those fields instead of a tier's
+ * named values.
+ */
+export const CATALOG_TIER = 'catalog';
+
+// Names the policy uses as tier values; a profile called one of these would be read as that.
+const RESERVED_PROFILES = ['standard', 'premium', 'catalog', 'denied', 'none', 'unknown'];
+
+/**
+ * Why a catalog record could not be enforced, or null when it can. Shared with the sync, which refuses
+ * the same records before writing them.
+ */
+export function catalogRecordProblem(doc) {
+  const profile = doc?.profile;
+  if (typeof profile !== 'string' || !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(profile) || profile.length > 64) {
+    return 'catalog record has no valid profile';
+  }
+  if (RESERVED_PROFILES.includes(profile)) return `catalog profile '${profile}' is a reserved tier name`;
+  // Sentinel commas make the policy's Contains() match whole deployment names; ',,' would read as allow-all.
+  if (typeof doc.models !== 'string' || doc.models.length > 1024 || !/^,([A-Za-z0-9][A-Za-z0-9._-]{0,63},)+$/.test(doc.models)) {
+    return 'catalog record has no valid model allowlist';
+  }
+  const monthly = doc.tokensPerMonth;
+  const daily = doc.tokensPerDay;
+  if (!Number.isSafeInteger(monthly) || monthly < 1) return 'catalog record has no valid monthly token limit';
+  if (!Number.isSafeInteger(daily) || daily < 1 || daily > monthly) return 'catalog record has no valid daily token limit';
+  return null;
+}
+
+/**
  * Turn a stored document into the record the gateway caches.
  *
  * Returns { ok: true, record } or { ok: false, status, reason }. The caller
@@ -48,7 +79,10 @@ export function toEntitlement(doc, { tenantId, now = new Date() } = {}) {
     return { ok: false, status: 403, reason: 'record belongs to a different tenant' };
   }
 
-  if (!KNOWN_TIERS.includes(doc.tier)) {
+  if (doc.tier === CATALOG_TIER) {
+    const problem = catalogRecordProblem(doc);
+    if (problem) return { ok: false, status: 409, reason: `${problem}; the gateway policy could not enforce it` };
+  } else if (!KNOWN_TIERS.includes(doc.tier)) {
     return {
       ok: false,
       status: 409,
@@ -91,6 +125,12 @@ export function toEntitlement(doc, { tenantId, now = new Date() } = {}) {
       mappingVersion: doc.mappingVersion ?? 0,
       effectiveFrom: doc.effectiveFrom ?? null,
       reconciliationGeneration: doc.reconciliationGeneration,
+      ...(doc.tier === CATALOG_TIER ? {
+        profile: doc.profile,
+        models: doc.models,
+        tokensPerMonth: doc.tokensPerMonth,
+        tokensPerDay: doc.tokensPerDay,
+      } : {}),
     },
   };
 }

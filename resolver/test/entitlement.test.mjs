@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { toEntitlement as resolveDocument, isObjectId, KNOWN_TIERS } from '../src/entitlement.mjs';
+import { toEntitlement as resolveDocument, isObjectId, KNOWN_TIERS, CATALOG_TIER, catalogRecordProblem } from '../src/entitlement.mjs';
 
 // Existing authorization cases use a current generation and verification time;
 // record freshness boundary cases exercise the unwrapped resolver in
@@ -121,3 +121,47 @@ test('object ids are validated before they reach a resource path', () => {
     assert.equal(isObjectId(bad), false, `${String(bad)} must not pass`);
   }
 });
+
+const catalogRecord = (fields = {}) => ({
+  id: OID, oid: OID, tenantId: TENANT, tier: CATALOG_TIER, businessUnit: '',
+  profile: 'advanced-l2-ha-so-op', models: ',claude-haiku-4-5,claude-sonnet-5,claude-opus-5,',
+  tokensPerMonth: 83333333, tokensPerDay: 8333333, ...fields,
+});
+
+test('a catalog record resolves with its profile, models and monthly and daily limits', () => {
+  const r = toEntitlement(catalogRecord(), { tenantId: TENANT });
+  assert.equal(r.ok, true);
+  assert.equal(r.record.tier, 'catalog');
+  assert.equal(r.record.profile, 'advanced-l2-ha-so-op');
+  assert.equal(r.record.models, ',claude-haiku-4-5,claude-sonnet-5,claude-opus-5,');
+  assert.equal(r.record.tokensPerMonth, 83333333);
+  assert.equal(r.record.tokensPerDay, 8333333);
+});
+
+test('a legacy record carries no catalog fields', () => {
+  const r = toEntitlement({ id: OID, tenantId: TENANT, tier: 'standard' }, { tenantId: TENANT });
+  assert.equal(r.ok, true);
+  assert.equal('profile' in r.record, false);
+  assert.equal('models' in r.record, false);
+});
+
+test('a catalog record the policy could not enforce is refused, not passed through', () => {
+  // An empty model list reads as allow-all on the legacy path; a catalog record must never mean that.
+  for (const [label, fields] of [
+    ['no profile', { profile: undefined }],
+    ['a reserved profile id', { profile: 'denied' }],
+    ['an empty model list', { models: ',,' }],
+    ['a model list without sentinel commas', { models: 'claude-sonnet-5' }],
+    ['a model name cmd.exe would re-read', { models: ',claude&calc,' }],
+    ['no monthly limit', { tokensPerMonth: undefined }],
+    ['a fractional daily limit', { tokensPerDay: 1.5 }],
+    ['a daily limit above the monthly one', { tokensPerDay: 83333334 }],
+  ]) {
+    const r = toEntitlement(catalogRecord(fields), { tenantId: TENANT });
+    assert.equal(r.ok, false, label);
+    assert.equal(r.status, 409, label);
+    assert.equal(catalogRecordProblem(catalogRecord(fields)) !== null, true, label);
+  }
+  assert.equal(catalogRecordProblem(catalogRecord()), null);
+});
+

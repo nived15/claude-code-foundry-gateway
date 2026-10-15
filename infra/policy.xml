@@ -88,6 +88,9 @@
              deployment and the list path below runs exactly as it always has. -->
         <set-variable name="entResolved" value="@(false)" />
         <set-variable name="entResolving" value="@(false)" />
+        <!-- An access-catalog record (scripts/new-scripts/claude-access-catalog.json) carries its own model
+             list and monthly and daily token limits; a tier record takes them from the named values. -->
+        <set-variable name="entCatalog" value="@(false)" />
         <choose>
             <when condition="@("{{entitlement-source}}" == "projection")">
                 <choose>
@@ -176,8 +179,17 @@
                                 <set-variable name="tier" value="@{
                                     var rec = JObject.Parse((string)context.Variables["entRecord"]);
                                     var t = (string)rec["tier"];
+                                    if (t == "catalog") { var p = (string)rec["profile"]; return string.IsNullOrEmpty(p) ? "denied" : p; }
                                     return (t == "premium" || t == "standard") ? t : "denied";
                                 }" />
+                                <choose>
+                                    <when condition="@((string)JObject.Parse((string)context.Variables["entRecord"])["tier"] == "catalog")">
+                                        <set-variable name="entCatalog" value="@(true)" />
+                                        <set-variable name="catalogModels" value="@((string)JObject.Parse((string)context.Variables["entRecord"])["models"] ?? "")" />
+                                        <set-variable name="catalogMonthly" value="@(((long?)JObject.Parse((string)context.Variables["entRecord"])["tokensPerMonth"] ?? 0L).ToString())" />
+                                        <set-variable name="catalogDaily" value="@(((long?)JObject.Parse((string)context.Variables["entRecord"])["tokensPerDay"] ?? 0L).ToString())" />
+                                    </when>
+                                </choose>
                                 <set-variable name="businessUnit" value="@{
                                     var rec = JObject.Parse((string)context.Variables["entRecord"]);
                                     var u = (string)rec["businessUnit"];
@@ -273,12 +285,14 @@
 
              An empty list, ",,", allows every model. That is the shipped
              default: tiers differ by budget until an operator decides they
-             should differ by model. -->
+             should differ by model. A catalog record always names its models,
+             so for it an empty list allows none. -->
         <set-variable name="modelAllowed" value="@{
-            var allowed = (string)context.Variables["tier"] == "premium"
-                ? "{{models-premium}}" : "{{models-standard}}";
-            if (allowed == null || allowed.Trim(',').Length == 0) { return true; }
-            return allowed.Contains("," + (string)context.Variables["modelName"] + ",");
+            var catalog = (bool)context.Variables["entCatalog"];
+            var allowed = catalog ? (string)context.Variables["catalogModels"]
+                : (string)context.Variables["tier"] == "premium" ? "{{models-premium}}" : "{{models-standard}}";
+            if (!catalog &amp;&amp; (allowed == null || allowed.Trim(',').Length == 0)) { return true; }
+            return allowed != null &amp;&amp; allowed.Contains("," + (string)context.Variables["modelName"] + ",");
         }" />
         <choose>
             <when condition="@(!(bool)context.Variables["modelAllowed"])">
@@ -660,10 +674,11 @@
         <!-- 7. Per-minute rate, by tier. This stays a branch because
              tokens-per-minute is one of the attributes the llm-token-limit
              reference does not allow an expression for. Exceeding it returns
-             429. -->
+             429. A catalog record has no per-minute rate: the access catalog
+             sets monthly and daily allowances only. -->
         <set-variable name="budget" value="personal" />
         <choose>
-            <when condition="@((string)context.Variables["tier"] == "premium")">
+            <when condition="@(!(bool)context.Variables["entCatalog"] &amp;&amp; (string)context.Variables["tier"] == "premium")">
                 <llm-token-limit
                     counter-key="@((string)context.Variables["userId"])"
                     tokens-per-minute="{{tpm-premium}}"
@@ -672,7 +687,7 @@
                     remaining-tokens-header-name="x-ratelimit-remaining-tokens"
                     tokens-consumed-header-name="x-tokens-consumed" />
             </when>
-            <otherwise>
+            <when condition="@(!(bool)context.Variables["entCatalog"])">
                 <llm-token-limit
                     counter-key="@((string)context.Variables["userId"])"
                     tokens-per-minute="{{tpm-standard}}"
@@ -680,7 +695,22 @@
                     retry-after-header-name="Retry-After"
                     remaining-tokens-header-name="x-ratelimit-remaining-tokens"
                     tokens-consumed-header-name="x-tokens-consumed" />
-            </otherwise>
+            </when>
+        </choose>
+
+        <!-- 7a. Monthly allowance per person, for a catalog record: the figure its
+             profile carries, keyed on oid like the daily budget below. Checked
+             first, so a developer whose month is spent is not told about a day. -->
+        <choose>
+            <when condition="@((bool)context.Variables["entCatalog"])">
+                <llm-token-limit
+                    counter-key="@((string)context.Variables["userId"] + ":monthly")"
+                    token-quota="@(long.Parse((string)context.Variables["catalogMonthly"]))"
+                    token-quota-period="Monthly"
+                    estimate-prompt-tokens="false"
+                    remaining-quota-tokens-header-name="x-quota-remaining-month"
+                    tokens-consumed-header-name="x-tokens-consumed" />
+            </when>
         </choose>
 
         <!-- 7b. Daily token budget, keyed on oid so one developer cannot starve
@@ -702,8 +732,8 @@
              with "Cannot implicitly convert type 'string' to 'long'". -->
         <set-variable name="effectiveQuota" value="@{
             var oid = (string)context.Variables["userId"];
-            var tierQuota = (string)context.Variables["tier"] == "premium"
-                ? "{{quota-premium}}" : "{{quota-standard}}";
+            var tierQuota = (bool)context.Variables["entCatalog"] ? (string)context.Variables["catalogDaily"]
+                : (string)context.Variables["tier"] == "premium" ? "{{quota-premium}}" : "{{quota-standard}}";
             var map = "{{quota-overrides}}";
             var marker = "," + oid + "=";
             var i = map.IndexOf(marker);

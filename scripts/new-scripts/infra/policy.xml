@@ -1,0 +1,1011 @@
+<!--
+  Claude Code on Microsoft Foundry - governed gateway policy (tiered).
+
+  Identity
+  ========
+  Claude Code's Foundry mode acquires the developer's own Entra ID token through
+  DefaultAzureCredential, so every request carries a real, unforgeable user
+  object id (oid). The gateway validates that token, decides the caller's tier,
+  meters against the oid, then discards the token and calls Foundry with the
+  gateway's own managed identity.
+
+  Developers hold no Foundry credential. Removing a person from the Entra group
+  removes their access; nothing has to be revoked on the endpoint itself.
+
+  Authorization
+  =============
+  allow-standard / allow-premium are comma-delimited lists of object ids kept in
+  sync from Entra groups by Sync-ClaudeAccess.ps1. Sentinel commas make the
+  contains() check exact so one id cannot partially match another.
+-->
+<policies>
+    <inbound>
+        <base />
+
+        <!-- 1. Authenticate the caller. The standard helper path requests a
+             token for the Cognitive Services data plane. An external IdP can
+             instead send a token for a public-client app (id_token) or an
+             explicit gateway API audience (access_token). That extra audience
+             is accepted only when the installer recorded it. -->
+        <choose>
+            <when condition="@(!string.IsNullOrWhiteSpace(&quot;{{external-idp-extra-audience}}&quot;) &amp;&amp; &quot;{{external-idp-extra-audience}}&quot; != &quot;urn:disabled:claude-extra-audience&quot;)">
+                <validate-azure-ad-token
+                    tenant-id="{{tenant-id}}"
+                    output-token-variable-name="jwt"
+                    failed-validation-httpcode="401"
+                    failed-validation-error-message="A Microsoft Entra ID token is required. Run 'az login'.">
+                    <audiences>
+                        <audience>https://cognitiveservices.azure.com</audience>
+                        <audience>https://ai.azure.com</audience>
+                        <audience>{{external-idp-extra-audience}}</audience>
+                    </audiences>
+                </validate-azure-ad-token>
+            </when>
+            <otherwise>
+                <validate-azure-ad-token
+                    tenant-id="{{tenant-id}}"
+                    output-token-variable-name="jwt"
+                    failed-validation-httpcode="401"
+                    failed-validation-error-message="A Microsoft Entra ID token is required. Run 'az login'.">
+                    <audiences>
+                        <audience>https://cognitiveservices.azure.com</audience>
+                        <audience>https://ai.azure.com</audience>
+                    </audiences>
+                </validate-azure-ad-token>
+            </otherwise>
+        </choose>
+
+        <!-- 2. Identity from the validated token. -->
+        <set-variable name="userId" value="@(((Jwt)context.Variables["jwt"]).Claims.GetValueOrDefault("oid", "unknown"))" />
+        <set-variable name="userUpn" value="@{
+            var jwt = (Jwt)context.Variables["jwt"];
+            return jwt.Claims.GetValueOrDefault("upn",
+                   jwt.Claims.GetValueOrDefault("unique_name",
+                   jwt.Claims.GetValueOrDefault("preferred_username",
+                   jwt.Claims.GetValueOrDefault("azp", "service-principal"))));
+        }" />
+        <set-variable name="sessionId" value="@(context.Request.Headers.GetValueOrDefault("x-claude-code-session-id", "none"))" />
+        <set-variable name="modelName" value="@{
+            try { return context.Request.Body.As<JObject>(preserveContent: true)["model"]?.ToString() ?? "unknown"; }
+            catch { return "unknown"; }
+        }" />
+        <set-variable name="usdRequestStream" value="@{
+            try { return (bool?)context.Request.Body.As&lt;JObject&gt;(preserveContent: true)["stream"] ?? false; }
+            catch { return true; }
+        }" />
+
+        <!-- 2b. Where entitlement comes from.
+             
+             Both paths are here from this deployment onward, chosen by a named
+             value, so moving a gateway that is already carrying traffic is a
+             configuration change rather than a policy deployment. ADR-0013
+             records why: a policy that grows the resolver path later has to be
+             redeployed and re-verified against production traffic, on the day
+             nobody wants to be changing it.
+             
+             entitlement-source is 'named-value' everywhere until an operator
+             changes it, so this block resolves to nothing on every existing
+             deployment and the list path below runs exactly as it always has. -->
+        <set-variable name="entResolved" value="@(false)" />
+        <set-variable name="entResolving" value="@(false)" />
+        <!-- An access-catalog record (scripts/new-scripts/claude-access-catalog.json) carries its own model
+             list and monthly and daily token limits; a tier record takes them from the named values. -->
+        <set-variable name="entCatalog" value="@(false)" />
+        <choose>
+            <when condition="@("{{entitlement-source}}" == "projection")">
+                <choose>
+                    <!-- Configured to use the projection with no resolver behind
+                         it. This is a misconfiguration rather than an outage, and
+                         it is worth its own message: the operator who flipped
+                         entitlement-source is the only person who can fix it, and
+                         a generic "unavailable" sends them looking at the wrong
+                         thing. -->
+                    <when condition="@("{{entitlement-resolver-url}}".Contains("resolver-not-deployed"))">
+                        <return-response>
+                            <set-status code="503" reason="Service Unavailable" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>@{
+                                return new JObject(
+                                    new JProperty("type", "error"),
+                                    new JProperty("error", new JObject(
+                                        new JProperty("type", "api_error"),
+                                        new JProperty("message",
+                                            "This gateway is configured to read entitlement from the projection, but no " +
+                                            "resolver is deployed. Set entitlement-resolver-url, or set entitlement-source " +
+                                            "back to named-value. No developer access has changed.")))
+                                ).ToString();
+                            }</set-body>
+                        </return-response>
+                    </when>
+                    <otherwise>
+                        <!-- Marked so on-error can tell an entitlement failure
+                             from any other, and answer 503 rather than 500.
+                             send-request's ignore-error covers a transport
+                             failure but not a managed-identity token failure,
+                             which throws out of the whole block. -->
+                        <set-variable name="entResolving" value="@(true)" />
+                        <cache-lookup-value key="@("ent:v2:{{tenant-id}}:" + (string)context.Variables["userId"])" variable-name="entRecord" />
+                        <choose>
+                            <when condition="@(!context.Variables.ContainsKey("entRecord"))">
+                                <rate-limit-by-key calls="200" renewal-period="1" counter-key="entitlement-misses" />
+                                <limit-concurrency key="entitlement-misses" max-count="100">
+                                <send-request mode="new" response-variable-name="entResponse" timeout="5" ignore-error="true">
+                                    <set-url>@("{{entitlement-resolver-url}}" + "/entitlement/" + (string)context.Variables["userId"])</set-url>
+                                    <set-method>GET</set-method>
+                                    <authentication-managed-identity resource="{{entitlement-resolver-audience}}" />
+                                </send-request>
+                                </limit-concurrency>
+                                <choose>
+                                    <when condition="@(context.Variables.ContainsKey("entResponse") &amp;&amp; ((IResponse)context.Variables["entResponse"]).StatusCode == 200)">
+                                        <set-variable name="entRecord" value="@(((IResponse)context.Variables["entResponse"]).Body.As&lt;string&gt;(preserveContent: true))" />
+                                        <cache-store-value key="@("ent:v2:{{tenant-id}}:" + (string)context.Variables["userId"])" value="@((string)context.Variables["entRecord"])" duration="@(int.Parse("{{entitlement-cache-seconds}}"))" />
+                                    </when>
+                                    <!-- 404 is the resolver's answer for an identity with no
+                                         record: not entitled, the same as being in neither
+                                         list. It is an answer, not a failure, so it becomes
+                                         the ordinary 403 below.
+
+                                         Before this branch existed a 404 fell through to the
+                                         503 for an unreachable resolver. Measured on a live
+                                         gateway 2026-09-23: an identity removed from the
+                                         projection got 503 with Retry-After 5 and "this is not
+                                         a problem with your access" - so every unentitled
+                                         attempt read as an outage and invited a retry, and
+                                         none of it was cached, so each retry reached the
+                                         resolver again.
+
+                                         Cached for at most a minute, and never longer than the
+                                         configured window: long enough that a refused caller
+                                         cannot hammer the resolver, short enough that someone
+                                         just added to a group is let in promptly. -->
+                                    <when condition="@(context.Variables.ContainsKey("entResponse") &amp;&amp; ((IResponse)context.Variables["entResponse"]).StatusCode == 404)">
+                                        <set-variable name="entRecord" value="@("{'tier':'none','businessUnit':''}")" />
+                                        <cache-store-value key="@("ent:v2:{{tenant-id}}:" + (string)context.Variables["userId"])" value="@((string)context.Variables["entRecord"])" duration="@(Math.Min(60, int.Parse("{{entitlement-cache-seconds}}")))" />
+                                    </when>
+                                </choose>
+                            </when>
+                        </choose>
+                        <set-variable name="entFresh" value="@{
+                            if (!context.Variables.ContainsKey("entRecord")) { return false; }
+                            var rec = JObject.Parse((string)context.Variables["entRecord"]);
+                            if ((string)rec["tier"] == "none") { return true; }
+                            // ADR-0051: projection records persist until a sync changes or removes them.
+                            return !string.IsNullOrEmpty((string)rec["reconciliationGeneration"]);
+                        }" />
+                        <choose>
+                            <when condition="@(context.Variables.ContainsKey("entRecord") &amp;&amp; (bool)context.Variables["entFresh"])">
+                                <set-variable name="tier" value="@{
+                                    var rec = JObject.Parse((string)context.Variables["entRecord"]);
+                                    var t = (string)rec["tier"];
+                                    if (t == "catalog") { var p = (string)rec["profile"]; return string.IsNullOrEmpty(p) ? "denied" : p; }
+                                    return (t == "premium" || t == "standard") ? t : "denied";
+                                }" />
+                                <choose>
+                                    <when condition="@((string)JObject.Parse((string)context.Variables["entRecord"])["tier"] == "catalog")">
+                                        <set-variable name="entCatalog" value="@(true)" />
+                                        <set-variable name="catalogModels" value="@((string)JObject.Parse((string)context.Variables["entRecord"])["models"] ?? "")" />
+                                        <set-variable name="catalogMonthly" value="@(((long?)JObject.Parse((string)context.Variables["entRecord"])["tokensPerMonth"] ?? 0L).ToString())" />
+                                        <set-variable name="catalogDaily" value="@(((long?)JObject.Parse((string)context.Variables["entRecord"])["tokensPerDay"] ?? 0L).ToString())" />
+                                    </when>
+                                </choose>
+                                <set-variable name="businessUnit" value="@{
+                                    var rec = JObject.Parse((string)context.Variables["entRecord"]);
+                                    var u = (string)rec["businessUnit"];
+                                    return string.IsNullOrEmpty(u) ? "unassigned" : u;
+                                }" />
+                                <set-variable name="entResolved" value="@(true)" />
+                                <set-variable name="entResolving" value="@(false)" />
+                            </when>
+                            <otherwise>
+                                <!-- The resolver did not answer, or the cached
+                                     answer is not a usable projection record.
+                                     
+                                     ADR-0005 forbids treating this as
+                                     user-not-found. A 403 would tell an entitled
+                                     developer they have no access and send them
+                                     to their platform team with the wrong
+                                     problem. This is the gateway failing, not the
+                                     developer, so it says so and answers 503 -
+                                     which also puts it in availability metrics
+                                     rather than hiding it in the normal 403
+                                     rate. -->
+                                <return-response>
+                                    <set-status code="503" reason="Service Unavailable" />
+                                    <set-header name="Content-Type" exists-action="override">
+                                        <value>application/json</value>
+                                    </set-header>
+                                    <set-header name="Retry-After" exists-action="override">
+                                        <value>5</value>
+                                    </set-header>
+                                    <set-body>@{
+                                        return new JObject(
+                                            new JProperty("type", "error"),
+                                            new JProperty("error", new JObject(
+                                                new JProperty("type", "api_error"),
+                                                new JProperty("message",
+                                                    "The entitlement projection has no usable answer, or the entitlement service did not answer. " +
+                                                    "No usable entitlement answer is available. Your platform team must check the directory reconciliation " +
+                                                    "and the entitlement service. Retry shortly.")))
+                                        ).ToString();
+                                    }</set-body>
+                                </return-response>
+                            </otherwise>
+                        </choose>
+                    </otherwise>
+                </choose>
+            </when>
+        </choose>
+
+        <!-- 3. Resolve the tier from Entra group membership. -->
+        <choose>
+            <when condition="@(!(bool)context.Variables["entResolved"])">
+                <set-variable name="tier" value="@{
+                    var oid = "," + (string)context.Variables["userId"] + ",";
+                    if (("{{allow-premium}}").Contains(oid))  { return "premium"; }
+                    if (("{{allow-standard}}").Contains(oid)) { return "standard"; }
+                    return "denied";
+                }" />
+            </when>
+        </choose>
+
+        <!-- 4. Reject anyone not in a Claude Code group. -->
+        <choose>
+            <when condition="@((string)context.Variables["tier"] == "denied")">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        return new JObject(
+                            new JProperty("type", "error"),
+                            new JProperty("error", new JObject(
+                                new JProperty("type", "permission_error"),
+                                new JProperty("message", "Not entitled to Claude Code. Ask your platform team to add you to the 'claude-code-standard' or 'claude-code-premium' Entra group.")
+                            ))
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+
+        <!-- 5. Model allowlist, per tier.
+             ==========================================================
+             Checked here, before anything is forwarded, because this is the
+             one capability control that can be enforced server-side. A model
+             list delivered to a client is a preference: Anthropic's own
+             guidance is that "a user who can run a modified Claude Code binary
+             can bypass any client-side control". This one is not client-side.
+
+             Sentinel commas make the match exact, so claude-opus-5 cannot
+             match claude-opus-5-mini and a narrow list cannot be widened by a
+             prefix.
+
+             An empty list, ",,", allows every model. That is the shipped
+             default: tiers differ by budget until an operator decides they
+             should differ by model. A catalog record always names its models,
+             so for it an empty list allows none. -->
+        <set-variable name="modelAllowed" value="@{
+            var catalog = (bool)context.Variables["entCatalog"];
+            var allowed = catalog ? (string)context.Variables["catalogModels"]
+                : (string)context.Variables["tier"] == "premium" ? "{{models-premium}}" : "{{models-standard}}";
+            if (!catalog &amp;&amp; (allowed == null || allowed.Trim(',').Length == 0)) { return true; }
+            return allowed != null &amp;&amp; allowed.Contains("," + (string)context.Variables["modelName"] + ",");
+        }" />
+        <choose>
+            <when condition="@(!(bool)context.Variables["modelAllowed"])">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        return new JObject(
+                            new JProperty("type", "error"),
+                            new JProperty("error", new JObject(
+                                new JProperty("type", "invalid_request_error"),
+                                new JProperty("code", "model_not_allowed"),
+                                new JProperty("message", "The model '" + (string)context.Variables["modelName"] +
+                                    "' is not available to the " + (string)context.Variables["tier"] +
+                                    " tier. Your access is unaffected - choose a model your tier allows, or ask your platform team to widen the list.")
+                            ))
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+
+        <!-- 5b. Optional Azure AI Content Safety request screening. -->
+        <include-fragment fragment-id="content-safety-screening" />
+
+        <!-- 6. Organisation-wide monthly ceiling.
+             ==========================================================
+             A constant counter-key is a single counter shared by every caller.
+             Measured 2026-09-02 on a throwaway API: one caller drove the shared
+             counter to zero and two callers who had spent nothing of their own
+             quota were then refused. See docs/UNKNOWNS.md U1.
+
+             This is a soft cap. The llm-token-limit reference states that
+             high-concurrency requests can temporarily exceed the configured
+             limit, so it bounds spend rather than guaranteeing it.
+
+             It is also per gateway. The same reference states the policy tracks
+             usage independently at each gateway and does not aggregate across
+             the instance, so a multi-region deployment enforces this ceiling
+             once per region. Basic v2 is single-region, so one gateway is one
+             ceiling; on a multi-region Premium instance, budget accordingly.
+
+             Checked before the per-tier budgets so that when the organisation is
+             out of budget, that is what the developer is told.
+
+             The budget variable names which ceiling is being checked. Both
+             refusals are 403 with Reason=OpenAITokenQuotaExceeded, so on-error
+             cannot tell them apart from context.LastError alone. Policies run in
+             order and the failing one halts the pipeline, so the last value set
+             here is the budget that refused. -->
+        <set-variable name="budget" value="organisation" />
+        <llm-token-limit
+            counter-key="claude-org"
+            token-quota="{{quota-org}}"
+            token-quota-period="Monthly"
+            estimate-prompt-tokens="false"
+            remaining-quota-tokens-header-name="x-org-quota-remaining" />
+
+        <!-- 6. Business unit, and its budget. ADR-0007.
+             ==========================================================
+             A business unit is an Entra group registered with a budget. The
+             registry key is the stable identifier - it is what this counter,
+             the ledger and every report use - while the group behind it can be
+             renamed without orphaning the history.
+
+             A developer in no business unit is "unassigned". What happens then
+             is configurable and defaults to allow, because no developer has a
+             business unit at the moment this first deploys and a default of deny
+             would refuse every request on the deployment that installs it. The
+             target state is deny; Get-ClaudeBusinessUnit.ps1 reports how many
+             are still unassigned so that move is a decision with a number in
+             front of it.
+
+             Sentinel commas, so ",finance" cannot partially match
+             ",finance-emea". Same convention as the entitlement lists. -->
+        <choose>
+            <when condition="@(!(bool)context.Variables["entResolved"])">
+                <set-variable name="businessUnit" value="@{
+                    var oid = (string)context.Variables["userId"];
+                    var map = "{{bu-members}}";
+                    var marker = "," + oid + "=";
+                    var i = map.IndexOf(marker);
+                    if (i < 0) { return "unassigned"; }
+                    var start = i + marker.Length;
+                    var end = map.IndexOf(",", start);
+                    if (end < 0) { end = map.Length; }
+                    return map.Substring(start, end - start);
+                }" />
+            </when>
+        </choose>
+
+        <choose>
+            <when condition="@((string)context.Variables["businessUnit"] == "unassigned" && "{{bu-unassigned}}" == "deny")">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        return new JObject(
+                            new JProperty("type", "error"),
+                            new JProperty("error", new JObject(
+                                new JProperty("type", "permission_error"),
+                                new JProperty("message", "You are not assigned to a business unit, so this request has no budget to charge. Ask your platform team to add you to a business unit group.")
+                            ))
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+
+        <!-- The business unit's own monthly budget. Its quota comes from the
+             registry, looked up by the same anchored scan.
+
+             Zero means no budget is set for this unit, and the limit is skipped
+             rather than refusing everything - an unpriced business unit should
+             behave like the organisation ceiling alone, not like a wall. -->
+        <set-variable name="buQuota" value="@{
+            var bu = (string)context.Variables["businessUnit"];
+            var reg = "{{bu-registry}}";
+            var marker = "," + bu + "=";
+            var i = reg.IndexOf(marker);
+            if (i < 0) { return "0"; }
+            var start = i + marker.Length;
+            var end = reg.IndexOf(",", start);
+            if (end < 0) { end = reg.Length; }
+            var entry = reg.Substring(start, end - start);
+            var colon = entry.LastIndexOf(":");
+            if (colon < 0) { return "0"; }
+            var tokens = entry.Substring(colon + 1);
+            long parsed;
+            return long.TryParse(tokens, out parsed) && parsed > 0 ? tokens : "0";
+        }" />
+
+        <set-variable name="buMode" value="@{
+            var unit = (string)context.Variables["businessUnit"];
+            var map = "{{bu-modes}}";
+            var marker = "," + unit + "=";
+            var i = map.IndexOf(marker);
+            if (i < 0) { return "strict"; }
+            var start = i + marker.Length;
+            var end = map.IndexOf(",", start);
+            if (end < 0) { return "strict"; }
+            var mode = map.Substring(start, end - start);
+            return System.Text.RegularExpressions.Regex.IsMatch(mode, "^(notify|allowance:([1-9][0-9]?|100))$") ? mode : "strict";
+        }" />
+        <set-variable name="buLimit" value="@{
+            var mode = (string)context.Variables["buMode"];
+            if (mode == "notify") { return "0"; }
+            if (mode.StartsWith("allowance:")) {
+                var tokens = decimal.Parse((string)context.Variables["buQuota"]);
+                var pct = int.Parse(mode.Substring(10));
+                return ((long)Math.Min(long.MaxValue, tokens + Math.Floor(tokens * pct / 100m))).ToString();
+            }
+            return (string)context.Variables["buQuota"];
+        }" />
+        <choose>
+            <when condition="@((string)context.Variables["buQuota"] != "0" &amp;&amp; (string)context.Variables["buLimit"] != "0")">
+                <set-variable name="budget" value="business unit" />
+                <set-variable name="budgetUnit" value="@((string)context.Variables["businessUnit"])" />
+                <llm-token-limit
+                    counter-key="@("bu-" + (string)context.Variables["businessUnit"])"
+                    token-quota="@(long.Parse((string)context.Variables["buLimit"]))"
+                    token-quota-period="Monthly"
+                    estimate-prompt-tokens="false"
+                    remaining-quota-tokens-header-name="x-bu-quota-remaining"
+                    remaining-quota-tokens-variable-name="buRemaining" />
+            </when>
+        </choose>
+
+        <!-- 6b. The parent business unit, if this unit is a team. ADR-0008.
+             ==========================================================
+             A team is a unit that names a parent. The request is charged to the
+             team and to the business unit above it - two counters, both monthly,
+             both soft. A unit with no parent is charged once.
+
+             The cascade is two levels because it is written here as two policy
+             elements with statically written counter keys, and there is no loop.
+             Set-ClaudeBusinessUnit.ps1 refuses a deeper chain when it is
+             written, so a third level cannot silently go uncharged. -->
+        <set-variable name="parentUnit" value="@{
+            var unit = (string)context.Variables["businessUnit"];
+            var parents = "{{bu-parents}}";
+            var marker = "," + unit + "=";
+            var i = parents.IndexOf(marker);
+            if (i < 0) { return ""; }
+            var start = i + marker.Length;
+            var end = parents.IndexOf(",", start);
+            if (end < 0) { end = parents.Length; }
+            return parents.Substring(start, end - start);
+        }" />
+
+        <set-variable name="parentQuota" value="@{
+            var parent = (string)context.Variables["parentUnit"];
+            if (parent == "") { return "0"; }
+            var reg = "{{bu-registry}}";
+            var marker = "," + parent + "=";
+            var i = reg.IndexOf(marker);
+            if (i < 0) { return "0"; }
+            var start = i + marker.Length;
+            var end = reg.IndexOf(",", start);
+            if (end < 0) { end = reg.Length; }
+            var entry = reg.Substring(start, end - start);
+            var colon = entry.LastIndexOf(":");
+            if (colon < 0) { return "0"; }
+            var tokens = entry.Substring(colon + 1);
+            long parsed;
+            return long.TryParse(tokens, out parsed) && parsed > 0 ? tokens : "0";
+        }" />
+
+        <set-variable name="parentMode" value="@{
+            var unit = (string)context.Variables["parentUnit"];
+            var map = "{{bu-modes}}";
+            var marker = "," + unit + "=";
+            var i = map.IndexOf(marker);
+            if (i < 0) { return "strict"; }
+            var start = i + marker.Length;
+            var end = map.IndexOf(",", start);
+            if (end < 0) { return "strict"; }
+            var mode = map.Substring(start, end - start);
+            return System.Text.RegularExpressions.Regex.IsMatch(mode, "^(notify|allowance:([1-9][0-9]?|100))$") ? mode : "strict";
+        }" />
+        <set-variable name="parentLimit" value="@{
+            var mode = (string)context.Variables["parentMode"];
+            if (mode == "notify") { return "0"; }
+            if (mode.StartsWith("allowance:")) {
+                var tokens = decimal.Parse((string)context.Variables["parentQuota"]);
+                var pct = int.Parse(mode.Substring(10));
+                return ((long)Math.Min(long.MaxValue, tokens + Math.Floor(tokens * pct / 100m))).ToString();
+            }
+            return (string)context.Variables["parentQuota"];
+        }" />
+        <choose>
+            <when condition="@((string)context.Variables["parentUnit"] != "" &amp;&amp; (string)context.Variables["parentQuota"] != "0" &amp;&amp; (string)context.Variables["parentLimit"] != "0")">
+                <set-variable name="budget" value="business unit" />
+                <set-variable name="budgetUnit" value="@((string)context.Variables["parentUnit"])" />
+                <llm-token-limit
+                    counter-key="@("bu-" + (string)context.Variables["parentUnit"])"
+                    token-quota="@(long.Parse((string)context.Variables["parentLimit"]))"
+                    token-quota-period="Monthly"
+                    estimate-prompt-tokens="false"
+                    remaining-quota-tokens-header-name="x-bu-parent-quota-remaining"
+                    remaining-quota-tokens-variable-name="parentRemaining" />
+            </when>
+        </choose>
+
+        <!-- Observed-category dollars are reconciled outside inference. ADR-0026.
+             Base64 keeps JSON quotes out of policy string substitution. -->
+        <set-variable name="usdDecision" value="@{
+            try {
+                var spec = JObject.Parse(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String("{{usd-budgets}}")));
+                if (!spec.HasValues) { return "{}"; }
+                if ((int?)spec["schema_version"] != 1 || !(spec["items"] is JObject)) { throw new Exception("schema"); }
+                var budgets = (JObject)spec["items"];
+                var unit = (string)context.Variables["businessUnit"];
+                var parent = (string)context.Variables["parentUnit"];
+                var leafKey = (string.IsNullOrEmpty(parent) ? "organization:" : "department:") + unit;
+                var keys = new string[] {
+                    "user:" + (string)context.Variables["userId"],
+                    leafKey,
+                    "organization:" + parent
+                };
+                var notices = new JArray();
+                var enforced = new System.Collections.Generic.List&lt;string&gt;();
+                foreach (var key in keys) {
+                    if (budgets[key] == null) { continue; }
+                    var mode = key.StartsWith("user:") ? "strict"
+                        : (string)context.Variables[key == leafKey ? "buMode" : "parentMode"];
+                    if (mode == "notify") {
+                        notices.Add(new JObject(new JProperty("scope", key), new JProperty("status", "usage-reported"),
+                            new JProperty("budget_usd", budgets[key]["amount_usd"]),
+                            new JProperty("spent_usd", null), new JProperty("exact", false)));
+                    } else { enforced.Add(key); }
+                }
+                if (enforced.Count == 0) {
+                    return new JObject(new JProperty("notices", notices)).ToString(Newtonsoft.Json.Formatting.None);
+                }
+                var state = JObject.Parse(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String("{{usd-budget-state}}")));
+                var material = string.Join("\n", new string[] { "{{usd-budgets}}", "{{bu-modes}}", "{{bu-parents}}", "{{bu-members}}", "{{entitlement-source}}" });
+                var hash = BitConverter.ToString(System.Security.Cryptography.SHA256.Create().ComputeHash(System.Text.Encoding.UTF8.GetBytes(material))).Replace("-", "").ToLowerInvariant();
+                var now = DateTime.UtcNow;
+                var asof = ((DateTimeOffset)state["reconciled_at"]).UtcDateTime;
+                var until = ((DateTimeOffset)state["valid_until"]).UtcDateTime;
+                if ((int?)state["schema_version"] != 1 || (string)state["policy_revision"] != hash ||
+                    state["source_revision"] == null || now >= until || asof > now.AddSeconds(60) ||
+                    until > asof.AddSeconds(900) || !(state["items"] is JObject)) { throw new Exception("stale"); }
+                foreach (var key in enforced) {
+                    var entry = state["items"][key];
+                    var item = entry as JObject;
+                    if (entry is JArray) {
+                        var data = (JArray)entry;
+                        if ((string)state["encoding"] != "compact-v1" || data.Count != 8) { throw new Exception("encoding"); }
+                        var window = state["periods"][(string)data[0]] as JArray;
+                        var flags = (int)data[6];
+                        if (window == null || window.Count != 2 || flags < 0 || flags > 7) { throw new Exception("compact"); }
+                        var split = key.Split(':');
+                        item = new JObject(new JProperty("scope_type", split[0]), new JProperty("scope_id", split[1]),
+                            new JProperty("period", data[0]), new JProperty("period_start", window[0]), new JProperty("period_end", window[1]),
+                            new JProperty("price_book_date", state["price_book_date"]),
+                            new JProperty("budget_usd", data[1]), new JProperty("effective_budget_usd", data[2]),
+                            new JProperty("spent_usd", data[3]), new JProperty("status", data[4]), new JProperty("enforcement", data[5]),
+                            new JProperty("exact", (flags &amp; 1) != 0), new JProperty("cache_read_known", (flags &amp; 2) != 0),
+                            new JProperty("cache_write_known", (flags &amp; 4) != 0), new JProperty("unpriced_models", data[7]));
+                    }
+                    if (item == null) { throw new Exception("missing"); }
+                    var start = ((DateTimeOffset)item["period_start"]).UtcDateTime;
+                    var end = ((DateTimeOffset)item["period_end"]).UtcDateTime;
+                    if (now < start || now >= end) { throw new Exception("window"); }
+                    var status = (string)item["status"];
+                    if (status == "stop" || status == "unpriced") {
+                        var error = (JObject)item.DeepClone();
+                        error["code"] = status == "stop" ? "usd_budget_exceeded" : "usd_budget_unpriced";
+                        error["type"] = "rate_limit_error";
+                        error["reconciled_at"] = state["reconciled_at"].DeepClone();
+                        error["http_status"] = 403;
+                        var unpricedMessage = "Usage cannot be completely priced for this scope. Ask the gateway owner to correct the dated price book.";
+                        if (status == "unpriced") {
+                            var unpriced = item["unpriced_models"] as JArray;
+                            var priceBookDateToken = item["price_book_date"];
+                            var priceBookDate = (priceBookDateToken != null &amp;&amp; priceBookDateToken.Type == JTokenType.String) ? (string)priceBookDateToken : "";
+                            if (unpriced != null &amp;&amp; unpriced.Count &gt; 0 &amp;&amp; !string.IsNullOrEmpty(priceBookDate)) {
+                                var names = "";
+                                var modelCount = 0;
+                                foreach (var modelToken in unpriced) {
+                                    if (modelCount &gt;= 5) { break; }
+                                    if (modelToken == null || modelToken.Type != JTokenType.String) { continue; }
+                                    var model = (string)modelToken;
+                                    if (string.IsNullOrEmpty(model) || model.Length &gt; 64) { continue; }
+                                    var validModel = true;
+                                    foreach (var ch in model) {
+                                        if (!((ch &gt;= 'A' &amp;&amp; ch &lt;= 'Z') || (ch &gt;= 'a' &amp;&amp; ch &lt;= 'z') || (ch &gt;= '0' &amp;&amp; ch &lt;= '9') || ch == '.' || ch == '_' || ch == '-')) {
+                                            validModel = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!validModel) { continue; }
+                                    if (names.Length &gt; 0) { names += ", "; }
+                                    names += model;
+                                    modelCount++;
+                                }
+                                if (modelCount &gt; 0) {
+                                    var more = unpriced.Count - modelCount;
+                                    if (more &gt; 0) { names += " and " + more.ToString() + " more"; }
+                                    var entries = (modelCount == 1 &amp;&amp; more == 0) ? "its price-book entry" : "their price-book entries";
+                                    unpricedMessage = "Usage of " + names + " cannot be priced with the price book dated " + priceBookDate + ". Ask the gateway owner to add or correct " + entries + ", then reconcile.";
+                                }
+                            }
+                        }
+                        error["message"] = status == "stop"
+                            ? "The observed USD budget for this scope is spent. Ask its owner to raise it, then reconcile."
+                            : unpricedMessage;
+                        return error.ToString(Newtonsoft.Json.Formatting.None);
+                    }
+                    if (status == "notice") {
+                        notices.Add(new JObject(new JProperty("scope", key), new JProperty("status", "observed-usage"),
+                            new JProperty("spent_usd", item["spent_usd"]), new JProperty("budget_usd", item["budget_usd"]),
+                            new JProperty("exact", item["exact"]), new JProperty("reconciled_at", state["reconciled_at"])));
+                    } else if (status != "allow") { throw new Exception("decision"); }
+                }
+                return new JObject(new JProperty("notices", notices)).ToString(Newtonsoft.Json.Formatting.None);
+            } catch {
+                return new JObject(new JProperty("http_status", 503), new JProperty("type", "api_error"),
+                    new JProperty("code", "usd_budget_state_stale"),
+                    new JProperty("message", "USD budget state is missing, expired or does not match configuration. Reconcile budgets; token access has not been removed.")).ToString(Newtonsoft.Json.Formatting.None);
+            }
+        }" />
+        <choose>
+            <when condition="@(JObject.Parse((string)context.Variables["usdDecision"])["http_status"] != null)">
+                <return-response>
+                    <set-status code="@((int)JObject.Parse((string)context.Variables["usdDecision"])["http_status"])" reason="USD budget control" />
+                    <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+                    <set-body>@(new JObject(new JProperty("type", "error"), new JProperty("error", JObject.Parse((string)context.Variables["usdDecision"]))).ToString())</set-body>
+                </return-response>
+            </when>
+        </choose>
+
+        <!-- 7. Per-minute rate, by tier. This stays a branch because
+             tokens-per-minute is one of the attributes the llm-token-limit
+             reference does not allow an expression for. Exceeding it returns
+             429. A catalog record has no per-minute rate: the access catalog
+             sets monthly and daily allowances only. -->
+        <set-variable name="budget" value="personal" />
+        <choose>
+            <when condition="@(!(bool)context.Variables["entCatalog"] &amp;&amp; (string)context.Variables["tier"] == "premium")">
+                <llm-token-limit
+                    counter-key="@((string)context.Variables["userId"])"
+                    tokens-per-minute="{{tpm-premium}}"
+                    estimate-prompt-tokens="false"
+                    retry-after-header-name="Retry-After"
+                    remaining-tokens-header-name="x-ratelimit-remaining-tokens"
+                    tokens-consumed-header-name="x-tokens-consumed" />
+            </when>
+            <when condition="@(!(bool)context.Variables["entCatalog"])">
+                <llm-token-limit
+                    counter-key="@((string)context.Variables["userId"])"
+                    tokens-per-minute="{{tpm-standard}}"
+                    estimate-prompt-tokens="false"
+                    retry-after-header-name="Retry-After"
+                    remaining-tokens-header-name="x-ratelimit-remaining-tokens"
+                    tokens-consumed-header-name="x-tokens-consumed" />
+            </when>
+        </choose>
+
+        <!-- 7a. Monthly allowance per person, for a catalog record: the figure its
+             profile carries, keyed on oid like the daily budget below. Checked
+             first, so a developer whose month is spent is not told about a day. -->
+        <choose>
+            <when condition="@((bool)context.Variables["entCatalog"])">
+                <llm-token-limit
+                    counter-key="@((string)context.Variables["userId"] + ":monthly")"
+                    token-quota="@(long.Parse((string)context.Variables["catalogMonthly"]))"
+                    token-quota-period="Monthly"
+                    estimate-prompt-tokens="false"
+                    remaining-quota-tokens-header-name="x-quota-remaining-month"
+                    tokens-consumed-header-name="x-tokens-consumed" />
+            </when>
+        </choose>
+
+        <!-- 7b. Daily token budget, keyed on oid so one developer cannot starve
+             the team. Exceeding it returns 403.
+
+             quota-overrides gives one person a different daily budget without
+             moving them between tiers. It is comma-delimited, not JSON: a named
+             value substitutes its raw text into the expression, and JSON's own
+             double quotes would terminate the surrounding C# string literal.
+             Sentinel commas make the lookup exact, so one object id cannot
+             partially match another - the same reason allow-standard uses them.
+
+             Format: ,oid=tokens,oid=tokens,   Empty is ,,
+
+             token-quota takes an expression, which is what allows one policy to
+             serve both tiers and any override. Measured 2026-09-02: the
+             expression must return long. Int32 is rejected at deploy time with
+             "Expression return type 'System.Int32' is not allowed", and string
+             with "Cannot implicitly convert type 'string' to 'long'". -->
+        <set-variable name="effectiveQuota" value="@{
+            var oid = (string)context.Variables["userId"];
+            var tierQuota = (bool)context.Variables["entCatalog"] ? (string)context.Variables["catalogDaily"]
+                : (string)context.Variables["tier"] == "premium" ? "{{quota-premium}}" : "{{quota-standard}}";
+            var map = "{{quota-overrides}}";
+            var marker = "," + oid + "=";
+            var i = map.IndexOf(marker);
+            if (i < 0) { return tierQuota; }
+            var start = i + marker.Length;
+            var end = map.IndexOf(",", start);
+            if (end < 0) { end = map.Length; }
+            var found = map.Substring(start, end - start);
+            long parsed;
+            return long.TryParse(found, out parsed) && parsed > 0 ? found : tierQuota;
+        }" />
+        <llm-token-limit
+            counter-key="@((string)context.Variables["userId"] + ":daily")"
+            token-quota="@(long.Parse((string)context.Variables["effectiveQuota"]))"
+            token-quota-period="Daily"
+            estimate-prompt-tokens="false"
+            remaining-quota-tokens-header-name="x-quota-remaining-today" />
+
+        <!-- 8. Request-rate ceiling. Token budgets alone do not stop a runaway
+             agent loop making many small calls. -->
+        <rate-limit-by-key
+            calls="{{calls-per-minute}}"
+            renewal-period="60"
+            counter-key="@((string)context.Variables["userId"])"
+            retry-after-header-name="Retry-After" />
+
+        <!-- 9. Chargeback telemetry to Application Insights, sliced by
+             developer, tier, model and Claude Code session. Azure Monitor
+             allows at most 5 custom dimensions here. -->
+        <llm-emit-token-metric namespace="claudecode">
+            <dimension name="User" value="@((string)context.Variables["userUpn"])" />
+            <dimension name="UserId" value="@((string)context.Variables["userId"])" />
+            <dimension name="Tier" value="@((string)context.Variables["tier"])" />
+            <dimension name="Model" value="@((string)context.Variables["modelName"])" />
+            <dimension name="SessionId" value="@((string)context.Variables["sessionId"])" />
+        </llm-emit-token-metric>
+
+        <!-- 10. Swap the caller's token for the gateway's own identity. The
+             developer token is deliberately not forwarded: Foundry trusts only
+             the gateway's managed identity. -->
+        <authentication-managed-identity
+            resource="https://cognitiveservices.azure.com"
+            output-token-variable-name="msi-token"
+            ignore-error="false" />
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["msi-token"])</value>
+        </set-header>
+        <set-header name="x-api-key" exists-action="delete" />
+
+        <!-- 11. Attribution for Foundry-side logs. -->
+        <set-header name="x-gateway-user" exists-action="override">
+            <value>@((string)context.Variables["userUpn"])</value>
+        </set-header>
+    </inbound>
+
+    <backend>
+        <!-- Agent turns are long, so allow generous time. -->
+        <forward-request timeout="600" buffer-request-body="false" buffer-response="false" />
+    </backend>
+
+    <outbound>
+        <base />
+        <set-variable name="usdUsageJson" value="unknown" />
+        <choose>
+            <when condition="@(!(bool)context.Variables["usdRequestStream"] &amp;&amp; context.Response.StatusCode == 200 &amp;&amp; context.Request.Url.Path.EndsWith("/messages") &amp;&amp; context.Response.Headers.GetValueOrDefault("Content-Type", "").Contains("application/json"))">
+                <set-variable name="usdUsageJson" value="@{
+                    try {
+                        var body = context.Response.Body.As&lt;JObject&gt;(preserveContent: true);
+                        var usage = body["usage"] as JObject;
+                        if (usage == null) { return "unknown"; }
+                        var counts = new JObject();
+                        foreach (var name in new string[] { "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation", "inference_geo" }) {
+                            if (usage[name] != null) { counts[name] = usage[name].DeepClone(); }
+                        }
+                        var text = counts.ToString(Newtonsoft.Json.Formatting.None);
+                        return text.Length <= 1024 ? text : "unknown";
+                    } catch { return "unknown"; }
+                }" />
+            </when>
+        </choose>
+        <choose>
+            <when condition="@(JObject.Parse((string)context.Variables["usdDecision"])["notices"] is JArray &amp;&amp; ((JArray)JObject.Parse((string)context.Variables["usdDecision"])["notices"]).Count > 0)">
+                <set-header name="x-claude-usd-budget-notice" exists-action="override">
+                    <value>@(JObject.Parse((string)context.Variables["usdDecision"])["notices"].ToString(Newtonsoft.Json.Formatting.None))</value>
+                </set-header>
+            </when>
+        </choose>
+
+        <!-- Remaining quota is an estimate, not a monthly ledger (ADR-0019).
+             Notify has no limiter and therefore no remaining counter. Its
+             advisory is present before and after the base budget is reached. -->
+        <set-variable name="budgetNotice" value="@{
+            var notices = new System.Collections.Generic.List&lt;string&gt;();
+            foreach (var scope in new string[] { "bu", "parent" }) {
+                var budget = long.Parse((string)context.Variables[scope + "Quota"]);
+                if (budget == 0) { continue; }
+                var mode = (string)context.Variables[scope + "Mode"];
+                var unit = (string)context.Variables[scope == "bu" ? "businessUnit" : "parentUnit"];
+                if (mode == "notify") {
+                    notices.Add(unit + ";mode=notify;status=usage-reported");
+                } else if (mode.StartsWith("allowance:") &amp;&amp; context.Variables.ContainsKey(scope + "Remaining")) {
+                    var limit = long.Parse((string)context.Variables[scope + "Limit"]);
+                    var remaining = Convert.ToInt64(context.Variables[scope + "Remaining"]);
+                    if (remaining < limit - budget) { notices.Add(unit + ";mode=" + mode + ";status=estimated-over-budget"); }
+                }
+            }
+            return string.Join(", ", notices);
+        }" />
+        <choose>
+            <when condition="@((string)context.Variables["budgetNotice"] != "")">
+                <set-header name="x-claude-budget-notice" exists-action="override">
+                    <value>@((string)context.Variables["budgetNotice"])</value>
+                </set-header>
+            </when>
+        </choose>
+        <!-- The chargeback ledger's identity half. ADR-0006.
+             ==========================================================
+             The per-request token record is ApiManagementGatewayLlmLog, which
+             is a log rather than a metric, so it has no cardinality cap and
+             does not silently discard data past a hundred developers. What it
+             does not have is a caller: its columns are tokens, model and ids.
+
+             This supplies the caller, keyed on context.RequestId so the two can
+             be joined. The key is carried deliberately rather than inferred:
+             the log's CorrelationId is a GUID, and Application Insights
+             operation_Id is a W3C trace id, so they do not match.
+
+             A trace is used rather than a metric dimension because the trace
+             policy is documented as not affected by Application Insights
+             sampling - every invocation is logged, which is what a billing
+             record needs.
+
+             UsageJson is counts only, collected above for nonstream JSON.
+             Streaming bodies are never read. Their per-request cache remains
+             unknown rather than zero; this is not complete streaming billing. -->
+        <trace source="claude-chargeback" severity="information">
+            <message>@("chargeback " + (string)context.Variables["userUpn"])</message>
+            <metadata name="RequestId" value="@(context.RequestId.ToString())" />
+            <metadata name="UserId" value="@((string)context.Variables["userId"])" />
+            <metadata name="User" value="@((string)context.Variables["userUpn"])" />
+            <metadata name="Tier" value="@((string)context.Variables["tier"])" />
+            <metadata name="BusinessUnit" value="@((string)context.Variables["businessUnit"])" />
+            <metadata name="Model" value="@((string)context.Variables["modelName"])" />
+            <metadata name="UsageJson" value="@((string)context.Variables["usdUsageJson"])" />
+            <metadata name="ClientIp" value="@(context.Variables.GetValueOrDefault<string>("claude-edge-client-ip", context.Request.IpAddress))" />
+            <!-- Which client made the call. Captured raw and truncated rather
+                 than classified here: a classifier in policy needs a redeploy
+                 every time a client changes its agent string, where the same
+                 rule in KQL is a query edit. Truncated because a user agent has
+                 no length limit and this is one field on every request.
+
+                 Nothing else in APIM carries it - measured 2026-09-16,
+                 AppRequests.Properties holds only API and service metadata,
+                 ClientType reads "PC" and ClientBrowser is empty. -->
+            <metadata name="Client" value="@{
+                var ua = context.Request.Headers.GetValueOrDefault("User-Agent", "");
+                if (string.IsNullOrEmpty(ua)) { return "unknown"; }
+                return ua.Length > 120 ? ua.Substring(0, 120) : ua;
+            }" />
+        </trace>
+
+        <choose>
+            <when condition="@((string)context.Variables["buMode"] != "strict" || (string)context.Variables["parentMode"] != "strict")">
+                <trace source="claude-budget" severity="information">
+                    <message>Budget mode usage; join BudgetRequestId to the usage ledger for monthly totals.</message>
+                    <metadata name="BudgetRequestId" value="@(context.RequestId.ToString())" />
+                    <metadata name="BusinessUnit" value="@((string)context.Variables["businessUnit"])" />
+                    <metadata name="Mode" value="@((string)context.Variables["buMode"])" />
+                    <metadata name="BaseTokens" value="@((string)context.Variables["buQuota"])" />
+                    <!-- Trace metadata requires a non-empty value even when this scope has no parent or notice. -->
+                    <metadata name="ParentUnit" value="@(string.IsNullOrEmpty((string)context.Variables["parentUnit"]) ? "none" : (string)context.Variables["parentUnit"])" />
+                    <metadata name="ParentMode" value="@((string)context.Variables["parentMode"])" />
+                    <metadata name="ParentBaseTokens" value="@((string)context.Variables["parentQuota"])" />
+                    <metadata name="Notice" value="@(string.IsNullOrEmpty((string)context.Variables["budgetNotice"]) ? "none" : (string)context.Variables["budgetNotice"])" />
+                </trace>
+            </when>
+        </choose>
+
+        <set-header name="x-governed-by" exists-action="override">
+            <value>apim-claude-gateway</value>
+        </set-header>
+        <set-header name="x-claude-gateway-request-id" exists-action="override">
+            <value>@(context.RequestId.ToString())</value>
+        </set-header>
+        <set-header name="x-claude-tier" exists-action="override">
+            <value>@((string)context.Variables["tier"])</value>
+        </set-header>
+    </outbound>
+
+    <on-error>
+        <base />
+        <set-header name="x-gateway-error" exists-action="override">
+            <value>@(context.LastError?.Reason ?? "unknown")</value>
+        </set-header>
+
+        <!-- A budget refusal and an entitlement refusal are both 403, so without
+             this a developer who has simply run out of budget reads it as losing
+             access and raises a ticket.
+
+             Measured 2026-09-02: llm-token-limit raises
+             Reason=OpenAITokenQuotaExceeded, Source=llm-token-limit, Scope=api,
+             and its own body is {"statusCode":403,"message":"Token quota is
+             exceeded..."} - not Anthropic's error shape, so the client shows it
+             raw. This replaces it with the shape Claude Code expects and names
+             which budget ran out. -->
+        <choose>
+            <when condition="@(context.Variables.GetValueOrDefault&lt;bool&gt;("entResolving", false) &amp;&amp; (context.LastError.Source == "rate-limit-by-key" || context.LastError.Source == "limit-concurrency"))">
+                <return-response>
+                    <set-status code="429" reason="Too Many Requests" />
+                    <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+                    <set-header name="Retry-After" exists-action="override"><value>1</value></set-header>
+                    <set-body>{"type":"error","error":{"type":"rate_limit_error","message":"Entitlement lookup is busy. Retry shortly; your access has not changed."}}</set-body>
+                </return-response>
+            </when>
+            <when condition="@(context.Variables.ContainsKey("entResolving") &amp;&amp; (bool)context.Variables["entResolving"])">
+                <!-- Anything that threw while resolving entitlement from the
+                     projection. send-request's ignore-error covers a transport
+                     failure, but a managed-identity token failure throws out of
+                     the whole block and would otherwise reach the developer as
+                     an unexplained 500.
+                     
+                     Answered here as 503 for the same reason as the inline path:
+                     this is the gateway failing, not the developer, and it must
+                     not read as a loss of access. -->
+                <return-response>
+                    <set-status code="503" reason="Service Unavailable" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-header name="Retry-After" exists-action="override">
+                        <value>5</value>
+                    </set-header>
+                    <set-body>@{
+                        return new JObject(
+                            new JProperty("type", "error"),
+                            new JProperty("error", new JObject(
+                                new JProperty("type", "api_error"),
+                                new JProperty("message",
+                                    "The entitlement service could not be reached: " +
+                                    (context.LastError?.Reason ?? "unknown") +
+                                    ". This is not a problem with your access. Retry shortly.")))
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+
+        <choose>
+            <when condition="@(context.LastError?.Reason == "OpenAITokenQuotaExceeded")">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        var which = (string)(context.Variables.GetValueOrDefault("budget", "personal"));
+                        var msg = which == "organisation"
+                            ? "The organisation's Claude budget for this period is spent. Your access is unaffected - this limit is shared, so it applies to everyone until the budget resets or your platform team raises quota-org."
+                            : which == "business unit"
+                                ? "The Claude budget for your business unit (" + (string)(context.Variables.GetValueOrDefault("budgetUnit", "unknown")) + ") is spent for this period. Your access is unaffected - this budget is shared with your colleagues in that unit, and your platform team can raise it."
+                                : "Your Claude budget for this period is spent. Your access is unaffected; the budget resets at the start of the next period. Ask your platform team if you need a larger tier.";
+                        return new JObject(
+                            new JProperty("type", "error"),
+                            new JProperty("error", new JObject(
+                                new JProperty("type", "rate_limit_error"),
+                                new JProperty("budget", which),
+                                new JProperty("message", msg)
+                            ))
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+    </on-error>
+</policies>

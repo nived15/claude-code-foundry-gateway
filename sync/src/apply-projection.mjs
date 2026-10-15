@@ -27,13 +27,18 @@
  * bu-registry and bu-parents give the business units on every run (ADR-0049).
  * Its last line carries an event that the renewal alerts match.
  *
+ * --catalog <file> stores an access catalog (Import-ClaudeAccessCatalog.ps1) with a
+ * snapshot. From then on a --graph run reads the catalog's groups instead of the tier and business-unit
+ * groups, and writes catalog records that carry their own models and monthly and daily token limits.
+ *
  * Usage:
  *   node src/apply-projection.mjs --cosmos https://<acct>.documents.azure.com:443/
- *        --tenant <guid> (--snapshot file | --graph --standard g --premium g [--bu id=g ...])
+ *        --tenant <guid> (--snapshot file [--catalog file] | --graph --standard g --premium g [--bu id=g ...])
  *        [--whatif] [--allow-empty] [--keep-orphans]
  */
 import { readFileSync } from 'node:fs';
-import { mergeMembership, planChanges, removalLimitExceeded, toDocument, toStatusDocument, validateSnapshot, validateTargetedSnapshot, compareWithGateway, compareWithSnapshot, createReconciliation, normalizeJobSettings, validateJobSettings, statusPartitionKey, STATUS_RECORD_TYPE } from './plan.mjs';
+import { mergeMembership, planChanges, removalLimitExceeded, toDocument, toStatusDocument, validateSnapshot, validateTargetedSnapshot, compareWithGateway, compareWithSnapshot, createReconciliation, normalizeJobSettings, validateJobSettings, statusPartitionKey, STATUS_RECORD_TYPE,
+  accessCatalogId, validateAccessCatalog, resolveCatalogRecords, CATALOG_FIELDS } from './plan.mjs';
 import { acquireApplyLock, validateLockWait } from './apply-lock.mjs';
 import { resolveGroupId, getTransitiveMembers } from './graph.mjs';
 import { readGatewayUnits, sortUnitsByDepth } from './business-units.mjs';
@@ -106,6 +111,14 @@ async function step(stage, work) {
 if (!endpoint) fail('--cosmos is required');
 if (!tenantId) fail('--tenant is required: every record is stamped with it and the resolver refuses another');
 if (!GUID.test(tenantId)) fail('--tenant must be the tenant id GUID. Remedy: pass the tenant id from az account show --query tenantId -o tsv, or rerun scripts/Sync-ClaudeAccess.ps1 -ResourceGroup <rg> -ApimName <apim>.');
+const catalogRemedy = 'Remedy: rerun Import-ClaudeAccessCatalog.ps1 -Path <catalog.json> -Apply.';
+let catalogToStore = null;
+if (opt('--catalog')) {
+  if (!opt('--snapshot') || userOid) fail(`--catalog is applied with --snapshot, as a full apply. ${catalogRemedy}`);
+  try { catalogToStore = JSON.parse(readFileSync(opt('--catalog'), 'utf8').replace(/^\uFEFF/, '')); } catch (error) { fail(`access catalog refused: ${error.message}. ${catalogRemedy}`); }
+  const problems = validateAccessCatalog(catalogToStore, { tenantId });
+  if (problems.length) fail(`access catalog refused: ${problems.join('; ')}. ${catalogRemedy}`);
+}
 try { validateLockWait(lockWaitSeconds); } catch (error) { fail(error.message, 1, 'config'); }
 const standardOverride = opt('--standard');
 const premiumOverride = opt('--premium');
@@ -161,8 +174,10 @@ async function resolveMembership() {
   }
   if (userOid) fail('--user can only be used with --snapshot <file>');
   if (!flag('--graph')) fail('pass --snapshot <file> or --graph');
-  const groups = tierGroups();
   const verifiedAt = new Date();
+  const storedCatalog = await step('catalog-read', () => readAccessCatalog(containerRef()));
+  if (storedCatalog) return resolveCatalogMembership(storedCatalog, verifiedAt);
+  const groups = tierGroups();
   const units = await step('business-units', unitGroups);
   const token = await step('graph', async () => (await credential.getToken('https://graph.microsoft.com/.default')).token);
   const tiers = {};
@@ -201,24 +216,60 @@ async function resolveMembership() {
   return { records, mappingVersion: Math.floor(Date.now() / 1000), source: 'graph', reconciliation };
 }
 
+// The stored catalog decides membership once it exists; a missing document means the tier groups still do.
+async function readAccessCatalog(container) {
+  let resource = null;
+  try {
+    ({ resource } = await container.item(accessCatalogId(tenantId), accessCatalogId(tenantId)).read());
+  } catch (error) {
+    if (error?.code !== 404 && error?.statusCode !== 404) throw error;
+  }
+  if (!resource) return null;
+  const problems = validateAccessCatalog(resource, { tenantId });
+  if (problems.length) fail(`stored access catalog refused: ${problems.join('; ')}; nothing was written. ${catalogRemedy}`, 2, 'catalog-read');
+  return resource;
+}
+
+async function resolveCatalogMembership(catalog, verifiedAt) {
+  const token = await step('graph', async () => (await credential.getToken('https://graph.microsoft.com/.default')).token);
+  const membersByGroup = new Map();
+  await step('graph', async () => {
+    for (const g of [...catalog.groups].sort((a, b) => a.row - b.row)) {
+      // Strict, unlike a business unit: a missing catalog group would silently revoke everyone in it.
+      membersByGroup.set(g.objectId, await getTransitiveMembers(g.objectId, token));
+      log(`row ${String(g.row).padStart(2)}  ${g.profile.padEnd(24)} ${membersByGroup.get(g.objectId).length} member(s)`);
+    }
+  });
+  const { records, conflicts, denied } = resolveCatalogRecords(catalog, membersByGroup);
+  log(`catalog   ${catalog.catalogVersion}: ${records.length} record(s), ${conflicts.length} in more than one group, ${denied.length} refused by the deny rule`);
+  const reconciliation = await step('lease', async () => createReconciliation({ verifiedAt, maxAgeSeconds: Number(opt('--max-age-seconds', 7200)) }));
+  return { records, mappingVersion: Math.floor(Date.now() / 1000), source: `graph catalog ${catalog.catalogVersion}`, reconciliation,
+    catalog: { catalogVersion: catalog.catalogVersion, catalogConflicts: conflicts.length, catalogDenied: denied.length } };
+}
+
 // The container indexes only /oid (infra/projection.bicep), so no query here has a WHERE clause: a
 // filter on another path would scan every record. Entitlement reads skip typed documents (status
 // records, the apply lock) in the client; status reads are scoped to the status partition.
 // A long read renews the lease between pages, so a large container cannot outlive it before the first write.
 async function readExisting(container, lock) {
   const existing = new Map();
-  const iterator = container.items.query('SELECT c.id, c.tier, c.businessUnit, c.expiresAt, c.type FROM c', { maxItemCount: 1000 });
+  const iterator = container.items.query(`SELECT c.id, c.tier, c.businessUnit, c.expiresAt, c.type, ${CATALOG_FIELDS.map((f) => `c.${f}`).join(', ')} FROM c`, { maxItemCount: 1000 });
   while (iterator.hasMoreResults()) {
     const { resources } = await iterator.fetchNext();
     for (const d of resources ?? []) {
       if (d.type !== undefined) continue;
-      const current = { tier: d.tier, businessUnit: d.businessUnit ?? '' };
-      if (Object.hasOwn(d, 'expiresAt')) current.expiresAt = d.expiresAt;
-      existing.set(d.id, current);
+      existing.set(d.id, currentEntitlement(d));
     }
     if (lock) await lock.renewIfNeeded();
   }
   return existing;
+}
+
+function currentEntitlement(d) {
+  const current = { tier: d.tier, businessUnit: d.businessUnit ?? '' };
+  for (const field of CATALOG_FIELDS) if (Object.hasOwn(d, field)) current[field] = d[field];
+  if (Object.hasOwn(d, 'expiresAt')) current.expiresAt = d.expiresAt;
+  return current;
 }
 
 async function readExistingUser(container, oid) {
@@ -230,9 +281,7 @@ async function readExistingUser(container, oid) {
     if (error?.code !== 404 && error?.statusCode !== 404) throw error;
   }
   if (resource && !resource.type) {
-    const current = { tier: resource.tier, businessUnit: resource.businessUnit ?? '' };
-    if (Object.hasOwn(resource, 'expiresAt')) current.expiresAt = resource.expiresAt;
-    existing.set(resource.id, current);
+    existing.set(resource.id, currentEntitlement(resource));
   }
   return existing;
 }
@@ -264,6 +313,7 @@ async function bulk(container, operations, lock) {
 
 const started = Date.now();
 const containerRef = () => new CosmosClient({ endpoint, aadCredentials: credential }).database(databaseName).container(containerName);
+const ENTITLEMENT_QUERY = `SELECT c.id, c.oid, c.tier, c.businessUnit, c.tenantId, c.reconciliationGeneration, c.lastVerifiedAt, c.expiresAt, c.type, ${CATALOG_FIELDS.map((f) => `c.${f}`).join(', ')} FROM c`;
 
 // --compare <gateway-decisions.json>: read-only. What each identity would
 // experience at the flip, from the records the resolver would actually serve.
@@ -271,7 +321,7 @@ if (opt('--compare')) {
   const gw = JSON.parse(readFileSync(opt('--compare'), 'utf8').replace(/^\uFEFF/, ''));
   if (gw.kind !== 'claude-gateway-decisions') fail("--compare expects a file written by Compare-ClaudeEntitlement.ps1 -ExportGatewayPath");
   const records = [];
-  const it = containerRef().items.query('SELECT c.id, c.oid, c.tier, c.businessUnit, c.tenantId, c.reconciliationGeneration, c.lastVerifiedAt, c.expiresAt, c.type FROM c', { maxItemCount: 1000 });
+  const it = containerRef().items.query(ENTITLEMENT_QUERY, { maxItemCount: 1000 });
   while (it.hasMoreResults()) { const { resources } = await it.fetchNext(); records.push(...(resources ?? []).filter((r) => r.type === undefined)); }
   const { compared, differences } = compareWithGateway(gw, records, { tenantId });
   const byKind = differences.reduce((a, d) => ({ ...a, [d.kind]: (a[d.kind] ?? 0) + 1 }), {});
@@ -284,7 +334,7 @@ if (opt('--compare')) {
 if (opt('--compare-snapshot')) {
   const snap = JSON.parse(readFileSync(opt('--compare-snapshot'), 'utf8').replace(/^\uFEFF/, ''));
   const records = [];
-  const it = containerRef().items.query('SELECT c.id, c.oid, c.tier, c.businessUnit, c.tenantId, c.reconciliationGeneration, c.lastVerifiedAt, c.expiresAt, c.type FROM c', { maxItemCount: 1000 });
+  const it = containerRef().items.query(ENTITLEMENT_QUERY, { maxItemCount: 1000 });
   while (it.hasMoreResults()) { const { resources } = await it.fetchNext(); records.push(...(resources ?? []).filter((r) => r.type === undefined)); }
   const comparison = compareWithSnapshot(snap, records, { tenantId });
   if (comparison.refused) fail(`snapshot refused: ${comparison.problems.join('; ')}. Remedy: rerun the switch or the deployer, which exports a fresh snapshot before it compares.`, 2);
@@ -293,7 +343,7 @@ if (opt('--compare-snapshot')) {
   process.exit(comparison.differences.length ? 4 : 0);
 }
 
-let { records, mappingVersion, source, reconciliation, scope = 'full' } = await resolveMembership();
+let { records, mappingVersion, source, reconciliation, scope = 'full', catalog: catalogSummary = null } = await resolveMembership();
 const container = containerRef();
 const runId = process.env.CONTAINER_APP_JOB_EXECUTION_NAME ?? process.env.PROJECTION_RUN_ID ?? `local-${started}`;
 const lockClock = createLockClock();
@@ -349,6 +399,8 @@ try {
     ok: true, source, whatIf, resolved: records.length, existing: existing.size,
     toWrite: plan.toWrite.length, toDelete: plan.toDelete.length, keptOrphans: plan.keptOrphans.length, unchanged: plan.unchanged,
     excludedByNewerTargetedSync,
+    ...(catalogSummary ?? {}),
+    ...(catalogToStore ? { catalogVersion: catalogToStore.catalogVersion } : {}),
   };
   if (userOid) summary.userRecord = records.find((r) => r.oid === userOid) ?? null;
   if (whatIf) { console.log(JSON.stringify(summary)); process.exit(0); }
@@ -362,6 +414,11 @@ try {
     await failAfterLock('--executor must be job or runner. Remedy: rerun with --executor job or --executor runner.', 2, 'config');
   }
 
+  // Stored before the records, so a scheduled run that starts after a partial apply reads this catalog.
+  if (catalogToStore) {
+    const stored = await step('catalog-write', () => bulk(container, [{ operationType: 'Upsert', partitionKey: catalogToStore.oid, resourceBody: catalogToStore }], lock));
+    if (stored.failed) await failAfterLock(`the access catalog could not be stored; no entitlement record was written. ${catalogRemedy}`, 3, 'catalog-write');
+  }
   const writes = await step('cosmos-write', () => bulk(container, plan.toWrite.map((r) => ({
     operationType: 'Upsert', partitionKey: r.oid, resourceBody: toDocument(r, { tenantId, mappingVersion, reconciliation }),
   })), lock));
